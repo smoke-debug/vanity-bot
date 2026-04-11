@@ -15,7 +15,7 @@ INVALID_LOG_CHANNEL_ID = 1491717674349367386
 
 # Safer defaults
 DELAY_SECONDS = 3.5          # normal delay between checks
-MAX_CODES_PER_RUN = 300     # hard cap per command
+MAX_CODES_PER_RUN = 600     # hard cap per command
 BACKOFF_SECONDS = 60       # wait when Discord pushes back
 MAX_RETRIES = 2            # retries for temporary errors
 
