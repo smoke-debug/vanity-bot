@@ -246,7 +246,7 @@ def build_help_embed(prefix: str = "!") -> discord.Embed:
         title="Vanity Checker Help",
         description=(
             "This bot checks Discord vanity invite codes, sends valid ones to your valid log channel, "
-            "and stores invalid ones in txt files grouped by code length.\n\n"
+            "sends invalid ones to your invalid log channel, and stores invalid ones in txt files grouped by code length.\n\n"
             "It also lets you clear invalid files and rebuild them from scratch whenever you want."
         ),
         color=discord.Color.blurple()
@@ -262,9 +262,10 @@ def build_help_embed(prefix: str = "!") -> discord.Embed:
             "• Cleans input into plain invite codes\n"
             "• Checks each code slowly to avoid rate limits\n"
             "• Sends valid codes to the valid log channel\n"
+            "• Sends invalid codes to the invalid log channel\n"
             "• Rebuilds invalid txt files for the lengths in that run\n"
             "• Removes codes that are no longer invalid\n"
-            "• Prevents duplicate invalid entries\n"
+            "• Prevents duplicate invalid entries in the file\n"
             "• Refuses to start if another scan is already running"
         ),
         inline=False
@@ -455,6 +456,7 @@ async def sendcodes(ctx, *, words: str):
     valid_count = 0
     invalid_count = 0
     error_count = 0
+    removed_from_invalid_count = 0
 
     start_check_state(ctx.author.id, len(cleaned_codes))
     status_msg = await ctx.send(
@@ -494,6 +496,13 @@ async def sendcodes(ctx, *, words: str):
             elif result == "invalid":
                 new_invalid_by_length[length].add(invite_code)
                 invalid_count += 1
+
+                try:
+                    await invalid_log_channel.send(
+                        f"{length} letters | Invalid: `discord.gg/{invite_code}`"
+                    )
+                except Exception as e:
+                    logger.exception("Failed to log invalid %s: %s", invite_code, e)
 
             elif result == "temporary_error":
                 error_count += 1
@@ -542,7 +551,6 @@ async def sendcodes(ctx, *, words: str):
                     break
 
     finally:
-        removed_from_invalid_count = 0
         added_to_invalid_count = 0
         synced_lengths = []
 
@@ -563,14 +571,6 @@ async def sendcodes(ctx, *, words: str):
             removed_from_invalid_count += len(removed_codes)
             added_to_invalid_count += len(added_codes)
             synced_lengths.append(length)
-
-            for code in sorted(added_codes):
-                try:
-                    await invalid_log_channel.send(
-                        f"{length} letters | Invalid: `discord.gg/{code}`"
-                    )
-                except Exception as e:
-                    logger.exception("Failed to log invalid %s: %s", code, e)
 
             for code in sorted(removed_codes):
                 try:
