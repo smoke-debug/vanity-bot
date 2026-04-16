@@ -142,6 +142,33 @@ def rewrite_all_invalid_files() -> None:
         rewrite_invalid_file(length)
 
 
+def add_invalid_code(code: str) -> bool:
+    code = normalize_code(code)
+    if not code:
+        return False
+
+    length = len(code)
+    if length not in TRACKED_LENGTHS:
+        return False
+
+    invalid_cache[length].add(code)
+    return True
+
+
+def remove_invalid_code(code: str) -> bool:
+    code = normalize_code(code)
+    if not code:
+        return False
+
+    length = len(code)
+    if length not in TRACKED_LENGTHS:
+        return False
+
+    if code in invalid_cache[length]:
+        invalid_cache[length].remove(code)
+    return True
+
+
 # =========================
 # CHECK STATE HELPERS
 # =========================
@@ -246,8 +273,7 @@ def build_help_embed(prefix: str = "!") -> discord.Embed:
         title="Vanity Checker Help",
         description=(
             "This bot checks Discord vanity invite codes, sends valid ones to your valid log channel, "
-            "sends invalid ones to your invalid log channel, and stores invalid ones in txt files grouped by code length.\n\n"
-            "It also lets you clear invalid files and rebuild them from scratch whenever you want."
+            "sends invalid ones to your invalid log channel, and stores invalid ones in txt files grouped by code length."
         ),
         color=discord.Color.blurple()
     )
@@ -263,10 +289,9 @@ def build_help_embed(prefix: str = "!") -> discord.Embed:
             "• Checks each code slowly to avoid rate limits\n"
             "• Sends valid codes to the valid log channel\n"
             "• Sends invalid codes to the invalid log channel\n"
-            "• Rebuilds invalid txt files for the lengths in that run\n"
-            "• Removes codes that are no longer invalid\n"
-            "• Prevents duplicate invalid entries in the file\n"
-            "• Refuses to start if another scan is already running"
+            "• Adds invalid codes to the txt files\n"
+            "• Removes codes from the txt files if they become valid\n"
+            "• Prevents duplicate input in the same run"
         ),
         inline=False
     )
@@ -277,18 +302,14 @@ def build_help_embed(prefix: str = "!") -> discord.Embed:
             "Clears invalid txt files so you can rebuild them from scratch.\n\n"
             f"**Examples:**\n"
             f"`{prefix}clearinvalid` → clears all invalid files\n"
-            f"`{prefix}clearinvalid 4` → clears only the 4-letter invalid file\n\n"
-            "After clearing, run `sendcodes` again to repopulate the file with fresh invalid codes."
+            f"`{prefix}clearinvalid 4` → clears only the 4-letter invalid file"
         ),
         inline=False
     )
 
     embed.add_field(
         name=f"{prefix}stop",
-        value=(
-            "Stops the current running `sendcodes` scan safely.\n\n"
-            "The bot keeps completed progress and still rewrites synced files cleanly."
-        ),
+        value="Stops the current running `sendcodes` scan safely.",
         inline=False
     )
 
@@ -361,10 +382,6 @@ async def stop(ctx):
 
 @bot.command()
 async def clearinvalid(ctx, length: int = None):
-    """
-    !clearinvalid        -> clears all invalid files
-    !clearinvalid 4      -> clears only invalid_4_letters.txt
-    """
     if check_state["running"]:
         await ctx.send("You cannot clear invalid files while a check is running. Use `!stop` first.")
         return
@@ -445,17 +462,10 @@ async def sendcodes(ctx, *, words: str):
 
     affected_lengths = sorted({len(code) for code in cleaned_codes})
 
-    old_invalid_by_length = {
-        length: set(invalid_cache[length])
-        for length in affected_lengths
-    }
-
-    checked_codes_by_length = defaultdict(set)
-    new_invalid_by_length = defaultdict(set)
-
     valid_count = 0
     invalid_count = 0
     error_count = 0
+    added_to_invalid_count = 0
     removed_from_invalid_count = 0
 
     start_check_state(ctx.author.id, len(cleaned_codes))
@@ -474,8 +484,6 @@ async def sendcodes(ctx, *, words: str):
                 break
 
             length = len(invite_code)
-            checked_codes_by_length[length].add(invite_code)
-
             logger.info("[%s/%s] Checking: %s", index, len(cleaned_codes), invite_code)
 
             result, payload = await safe_fetch_invite(invite_code)
@@ -485,16 +493,34 @@ async def sendcodes(ctx, *, words: str):
                 break
 
             if result == "valid":
-                valid_count += 1
+                was_invalid = invite_code in invalid_cache[length]
+
+                remove_invalid_code(invite_code)
+
+                if was_invalid:
+                    removed_from_invalid_count += 1
+                    try:
+                        await invalid_log_channel.send(
+                            f"{length} letters | Removed from invalid file because it is valid now: `discord.gg/{invite_code}`"
+                        )
+                    except Exception as e:
+                        logger.exception("Failed to log removal of %s: %s", invite_code, e)
 
                 try:
                     await send_channel.send(f"discord.gg/{invite_code}")
+                    valid_count += 1
                 except Exception as e:
                     logger.exception("Failed to send valid code %s: %s", invite_code, e)
                     error_count += 1
 
             elif result == "invalid":
-                new_invalid_by_length[length].add(invite_code)
+                already_invalid = invite_code in invalid_cache[length]
+
+                add_invalid_code(invite_code)
+
+                if not already_invalid:
+                    added_to_invalid_count += 1
+
                 invalid_count += 1
 
                 try:
@@ -510,7 +536,7 @@ async def sendcodes(ctx, *, words: str):
 
                 try:
                     await invalid_log_channel.send(
-                        f"{length} letters | Temporary error, skipped for sync: `discord.gg/{invite_code}`"
+                        f"{length} letters | Temporary error, skipped: `discord.gg/{invite_code}`"
                     )
                 except Exception as e:
                     logger.exception("Failed to log temp error %s: %s", invite_code, e)
@@ -526,7 +552,7 @@ async def sendcodes(ctx, *, words: str):
 
                 try:
                     await invalid_log_channel.send(
-                        f"{length} letters | Error, skipped for sync: `discord.gg/{invite_code}`"
+                        f"{length} letters | Error, skipped: `discord.gg/{invite_code}`"
                     )
                 except Exception as e:
                     logger.exception("Failed to log fatal error %s: %s", invite_code, e)
@@ -537,6 +563,7 @@ async def sendcodes(ctx, *, words: str):
                         content=(
                             f"Progress: {index}/{len(cleaned_codes)}\n"
                             f"Valid: {valid_count} | Invalid: {invalid_count} | Errors: {error_count}\n"
+                            f"Added to invalid files: {added_to_invalid_count} | Removed: {removed_from_invalid_count}\n"
                             f"Affected lengths: {', '.join(map(str, affected_lengths))}\n"
                             f"Stop requested: {'Yes' if check_state['stop_requested'] else 'No'}"
                         )
@@ -551,34 +578,8 @@ async def sendcodes(ctx, *, words: str):
                     break
 
     finally:
-        added_to_invalid_count = 0
-        synced_lengths = []
-
         for length in affected_lengths:
-            old_set = old_invalid_by_length.get(length, set())
-            checked_set = checked_codes_by_length.get(length, set())
-            new_invalid_set = new_invalid_by_length.get(length, set())
-
-            unchanged_old_entries = old_set - checked_set
-            final_invalid_set = unchanged_old_entries | new_invalid_set
-
-            removed_codes = old_set & checked_set & (old_set - new_invalid_set)
-            added_codes = new_invalid_set - old_set
-
-            invalid_cache[length] = final_invalid_set
             rewrite_invalid_file(length)
-
-            removed_from_invalid_count += len(removed_codes)
-            added_to_invalid_count += len(added_codes)
-            synced_lengths.append(length)
-
-            for code in sorted(removed_codes):
-                try:
-                    await invalid_log_channel.send(
-                        f"{length} letters | Removed from invalid file because it is valid now: `discord.gg/{code}`"
-                    )
-                except Exception as e:
-                    logger.exception("Failed to log removal of %s: %s", code, e)
 
         summary_lines = []
         if stopped_early or check_state["stop_requested"]:
@@ -593,7 +594,7 @@ async def sendcodes(ctx, *, words: str):
             f"Errors: {error_count}",
             f"Added to invalid files: {added_to_invalid_count}",
             f"Removed from invalid files: {removed_from_invalid_count}",
-            f"Synced lengths: {', '.join(map(str, synced_lengths)) if synced_lengths else 'None'}",
+            f"Rewritten lengths: {', '.join(map(str, affected_lengths)) if affected_lengths else 'None'}",
             f"Files folder: {DATA_DIR}",
         ])
 
