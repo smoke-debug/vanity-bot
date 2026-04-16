@@ -58,6 +58,7 @@ check_state = {
     "current": 0,
 }
 
+
 # =========================
 # FILE HELPERS
 # =========================
@@ -73,6 +74,7 @@ def get_invalid_file_path(length: int) -> Path:
 def ensure_invalid_file(length: int) -> Path:
     file_path = get_invalid_file_path(length)
     if not file_path.exists():
+        file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.touch(exist_ok=True)
         logger.info("Created missing file: %s", file_path)
     return file_path
@@ -125,9 +127,11 @@ def rewrite_invalid_file(length: int) -> bool:
         file_path = ensure_invalid_file(length)
         codes = sorted(invalid_cache[length])
 
-        with open(file_path, "w", encoding="utf-8") as f:
+        with open(file_path, "w", encoding="utf-8", newline="\n") as f:
             for code in codes:
                 f.write(f"{code}\n")
+            f.flush()
+            os.fsync(f.fileno())
 
         logger.info("Rewrote file %s with %s codes.", file_path, len(codes))
         return True
@@ -152,7 +156,7 @@ def add_invalid_code(code: str) -> bool:
         return False
 
     invalid_cache[length].add(code)
-    return True
+    return rewrite_invalid_file(length)
 
 
 def remove_invalid_code(code: str) -> bool:
@@ -166,7 +170,14 @@ def remove_invalid_code(code: str) -> bool:
 
     if code in invalid_cache[length]:
         invalid_cache[length].remove(code)
+        logger.info("Removed code from invalid cache: %s", code)
+        return rewrite_invalid_file(length)
+
     return True
+
+
+def get_invalid_count(length: int) -> int:
+    return len(invalid_cache[length])
 
 
 # =========================
@@ -289,8 +300,8 @@ def build_help_embed(prefix: str = "!") -> discord.Embed:
             "• Checks each code slowly to avoid rate limits\n"
             "• Sends valid codes to the valid log channel\n"
             "• Sends invalid codes to the invalid log channel\n"
-            "• Adds invalid codes to the txt files\n"
-            "• Removes codes from the txt files if they become valid\n"
+            "• Immediately writes invalid txt files when changes happen\n"
+            "• Removes codes from txt files if they become valid\n"
             "• Prevents duplicate input in the same run"
         ),
         inline=False
@@ -308,17 +319,23 @@ def build_help_embed(prefix: str = "!") -> discord.Embed:
     )
 
     embed.add_field(
-        name=f"{prefix}stop",
-        value="Stops the current running `sendcodes` scan safely.",
+        name=f"{prefix}getinvalid <length>",
+        value=(
+            "Rewrites and sends the invalid txt file for a specific code length.\n\n"
+            f"Examples: `{prefix}getinvalid 3`, `{prefix}getinvalid 4`, `{prefix}getinvalid 5`"
+        ),
         inline=False
     )
 
     embed.add_field(
-        name=f"{prefix}getinvalid <length>",
-        value=(
-            "Sends the invalid txt file for a specific code length directly in Discord.\n\n"
-            f"Examples: `{prefix}getinvalid 3`, `{prefix}getinvalid 4`, `{prefix}getinvalid 5`"
-        ),
+        name=f"{prefix}invalidcount <length>",
+        value="Shows how many invalid codes are currently in memory for that length.",
+        inline=False
+    )
+
+    embed.add_field(
+        name=f"{prefix}stop",
+        value="Stops the current running `sendcodes` scan safely.",
         inline=False
     )
 
@@ -413,6 +430,16 @@ async def clearinvalid(ctx, length: int = None):
 
 
 @bot.command()
+async def invalidcount(ctx, length: int):
+    if length < 1 or length > 32:
+        await ctx.send("Use a length between 1 and 32.")
+        return
+
+    load_invalid_cache()
+    await ctx.send(f"{length}-letter invalid count: {get_invalid_count(length)}")
+
+
+@bot.command()
 async def sendcodes(ctx, *, words: str):
     if check_state["running"]:
         await ctx.send(
@@ -495,16 +522,15 @@ async def sendcodes(ctx, *, words: str):
             if result == "valid":
                 was_invalid = invite_code in invalid_cache[length]
 
-                remove_invalid_code(invite_code)
-
                 if was_invalid:
-                    removed_from_invalid_count += 1
-                    try:
-                        await invalid_log_channel.send(
-                            f"{length} letters | Removed from invalid file because it is valid now: `discord.gg/{invite_code}`"
-                        )
-                    except Exception as e:
-                        logger.exception("Failed to log removal of %s: %s", invite_code, e)
+                    if remove_invalid_code(invite_code):
+                        removed_from_invalid_count += 1
+                        try:
+                            await invalid_log_channel.send(
+                                f"{length} letters | Removed from invalid file because it is valid now: `discord.gg/{invite_code}`"
+                            )
+                        except Exception as e:
+                            logger.exception("Failed to log removal of %s: %s", invite_code, e)
 
                 try:
                     await send_channel.send(f"discord.gg/{invite_code}")
@@ -516,9 +542,8 @@ async def sendcodes(ctx, *, words: str):
             elif result == "invalid":
                 already_invalid = invite_code in invalid_cache[length]
 
-                add_invalid_code(invite_code)
-
-                if not already_invalid:
+                saved_ok = add_invalid_code(invite_code)
+                if saved_ok and not already_invalid:
                     added_to_invalid_count += 1
 
                 invalid_count += 1
@@ -578,6 +603,7 @@ async def sendcodes(ctx, *, words: str):
                     break
 
     finally:
+        # Final safety rewrite for all touched lengths
         for length in affected_lengths:
             rewrite_invalid_file(length)
 
@@ -609,16 +635,32 @@ async def sendcodes(ctx, *, words: str):
 
 @bot.command()
 async def getinvalid(ctx, length: int):
-    if length < 1:
-        await ctx.send("Use a number above 0.")
+    if length < 1 or length > 32:
+        await ctx.send("Use a length between 1 and 32.")
         return
 
+    ensure_all_invalid_files()
+    load_invalid_cache()
+
+    ok = rewrite_invalid_file(length)
     file_path = ensure_invalid_file(length)
 
+    if not ok:
+        await ctx.send("Failed to rewrite that invalid file before sending it.")
+        return
+
+    if not file_path.exists():
+        await ctx.send("That invalid file does not exist.")
+        return
+
     try:
+        size_bytes = file_path.stat().st_size
         await ctx.send(
-            content=f"Here is your invalid vanity file for {length} letters:",
-            file=discord.File(file_path)
+            content=(
+                f"Here is your invalid vanity file for {length} letters:\n"
+                f"Entries: {len(invalid_cache[length])} | Size: {size_bytes} bytes"
+            ),
+            file=discord.File(str(file_path), filename=file_path.name)
         )
     except Exception as e:
         logger.exception("Failed to send invalid file %s: %s", file_path, e)
@@ -634,13 +676,20 @@ async def invalidfiles(ctx):
         await ctx.send(f"No invalid files found, but the folder exists: `{DATA_DIR}`")
         return
 
-    file_names = "\n".join(f.name for f in files[:30])
+    lines = []
+    for f in files[:30]:
+        try:
+            size_bytes = f.stat().st_size
+        except Exception:
+            size_bytes = -1
+        lines.append(f"{f.name} ({size_bytes} bytes)")
+
     extra = ""
     if len(files) > 30:
         extra = f"\n...and {len(files) - 30} more"
 
     await ctx.send(
-        f"Invalid txt files are stored in:\n`{DATA_DIR}`\n\nExisting files:\n{file_names}{extra}"
+        f"Invalid txt files are stored in:\n`{DATA_DIR}`\n\nExisting files:\n" + "\n".join(lines) + extra
     )
 
 
