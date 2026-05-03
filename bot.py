@@ -4,6 +4,7 @@ import asyncio
 import logging
 from pathlib import Path
 from collections import defaultdict
+from datetime import datetime, timezone
 
 import discord
 from discord.ext import commands, tasks
@@ -23,10 +24,7 @@ CONFIG_FILE = DATA_DIR / "vanity_config.json"
 
 TRACKED_LENGTHS = range(1, 33)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vanity_checker")
 
 intents = discord.Intents.default()
@@ -51,9 +49,21 @@ config = {
 }
 
 
-# =========================
-# FILE HELPERS
-# =========================
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def format_time(iso_time):
+    if not iso_time:
+        return "Unknown"
+
+    try:
+        dt = datetime.fromisoformat(iso_time)
+        unix = int(dt.timestamp())
+        return f"<t:{unix}:F> • <t:{unix}:R>"
+    except Exception:
+        return "Unknown"
+
 
 def ensure_dirs():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -82,8 +92,7 @@ def load_config():
     config["lists"] = loaded.get("lists", {})
 
 
-def invalid_file(length: int) -> Path:
-    ensure_dirs()
+def invalid_file(length):
     return INVALID_DIR / f"invalid_{length}_letters.txt"
 
 
@@ -93,7 +102,7 @@ def ensure_invalid_files():
         invalid_file(length).touch(exist_ok=True)
 
 
-def clean_code(item: str) -> str:
+def clean_code(item):
     return (
         str(item)
         .replace("https://discord.gg/", "")
@@ -106,6 +115,22 @@ def clean_code(item: str) -> str:
         .strip("/")
         .lower()
     )
+
+
+def parse_words(words):
+    seen = set()
+    cleaned = []
+
+    for item in words.split(","):
+        code = clean_code(item)
+
+        if not code or code in seen:
+            continue
+
+        seen.add(code)
+        cleaned.append(code)
+
+    return cleaned
 
 
 def load_invalid_cache():
@@ -121,14 +146,14 @@ def load_invalid_cache():
                     invalid_cache[length].add(code)
 
 
-def rewrite_invalid_file(length: int):
+def rewrite_invalid_file(length):
     path = invalid_file(length)
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
+    with open(path, "w", encoding="utf-8") as f:
         for code in sorted(invalid_cache[length]):
             f.write(code + "\n")
 
 
-def add_invalid(code: str):
+def add_invalid(code):
     code = clean_code(code)
     length = len(code)
 
@@ -145,7 +170,7 @@ def add_invalid(code: str):
     return False
 
 
-def remove_invalid(code: str):
+def remove_invalid(code):
     code = clean_code(code)
     length = len(code)
 
@@ -160,31 +185,30 @@ def remove_invalid(code: str):
     return False
 
 
-# =========================
-# DISCORD HELPERS
-# =========================
-
-async def get_channel(channel_id: int):
-    channel = bot.get_channel(channel_id)
+async def get_channel(channel_id):
+    channel = bot.get_channel(int(channel_id))
 
     if channel:
         return channel
 
     try:
-        return await bot.fetch_channel(channel_id)
+        return await bot.fetch_channel(int(channel_id))
     except Exception:
         return None
 
 
 async def safe_send(channel, content=None, embed=None, file=None):
+    if not channel:
+        return None
+
     try:
         return await channel.send(content=content, embed=embed, file=file)
     except Exception as e:
-        logger.warning("Failed sending message: %s", e)
+        logger.warning("Send failed: %s", e)
         return None
 
 
-async def sleep_with_stop(seconds: float):
+async def sleep_with_stop(seconds):
     waited = 0
 
     while waited < seconds:
@@ -197,7 +221,7 @@ async def sleep_with_stop(seconds: float):
     return False
 
 
-async def fetch_invite_status(code: str):
+async def fetch_invite_status(code):
     for attempt in range(1, MAX_RETRIES + 1):
         if check_state["stop_requested"]:
             return "stopped", None
@@ -213,8 +237,6 @@ async def fetch_invite_status(code: str):
             return "fatal", str(e)
 
         except discord.HTTPException as e:
-            logger.warning("HTTP error on %s attempt %s/%s: %s", code, attempt, MAX_RETRIES, e)
-
             if attempt < MAX_RETRIES:
                 stopped = await sleep_with_stop(BACKOFF_SECONDS * attempt)
                 if stopped:
@@ -224,40 +246,15 @@ async def fetch_invite_status(code: str):
             return "error", str(e)
 
         except Exception as e:
-            logger.exception("Unexpected error on %s", code)
             return "error", str(e)
 
     return "error", "Unknown error"
 
 
-def parse_words(words: str):
-    seen = set()
-    cleaned = []
-
-    for item in words.split(","):
-        code = clean_code(item)
-
-        if not code:
-            continue
-
-        if code in seen:
-            continue
-
-        seen.add(code)
-        cleaned.append(code)
-
-    return cleaned
-
-
-def build_summary_embed(list_name, processed, valid, invalid, errors, added, removed, stopped):
-    title = f"Check Finished: {list_name}"
-
-    if stopped:
-        title = f"Check Stopped: {list_name}"
-
+def build_summary_embed(list_name, processed, valid, invalid, errors, added, removed, stopped, updated_at):
     embed = discord.Embed(
-        title=title,
-        color=discord.Color.green() if not stopped else discord.Color.orange()
+        title=f"{'Check Stopped' if stopped else 'Check Finished'}: {list_name}",
+        color=discord.Color.orange() if stopped else discord.Color.green()
     )
 
     embed.add_field(name="Processed", value=str(processed), inline=True)
@@ -266,31 +263,29 @@ def build_summary_embed(list_name, processed, valid, invalid, errors, added, rem
     embed.add_field(name="Errors", value=str(errors), inline=True)
     embed.add_field(name="Added Invalid", value=str(added), inline=True)
     embed.add_field(name="Removed Invalid", value=str(removed), inline=True)
+    embed.add_field(name="List Last Updated", value=format_time(updated_at), inline=False)
 
-    embed.set_footer(text="Automatic vanity checker")
+    embed.set_footer(text="Vanity checker")
 
     return embed
 
 
-# =========================
-# CHECK ENGINE
-# =========================
+async def run_list_check(list_name, list_data, manual_ctx=None):
+    claim_channel = await get_channel(list_data["claim_channel_id"])
+    log_channel = await get_channel(list_data["log_channel_id"])
+    summary_channel = await get_channel(list_data["summary_channel_id"])
 
-async def run_list_check(list_name: str, list_data: dict, manual_ctx=None):
-    words = list_data.get("words", [])
-    channel_id = int(list_data.get("channel_id"))
     ping_role_id = list_data.get("ping_role_id")
+    words = list_data.get("words", [])
 
-    output_channel = await get_channel(channel_id)
-
-    if not output_channel:
+    if not claim_channel or not log_channel or not summary_channel:
         if manual_ctx:
-            await manual_ctx.send(f"Could not access the channel for list `{list_name}`.")
+            await manual_ctx.send(f"`{list_name}` has a missing/broken channel setup.")
         return
 
     cleaned_codes = []
-
     seen = set()
+
     for word in words:
         code = clean_code(word)
 
@@ -301,11 +296,10 @@ async def run_list_check(list_name: str, list_data: dict, manual_ctx=None):
         cleaned_codes.append(code)
 
     if not cleaned_codes:
-        await safe_send(output_channel, f"`{list_name}` has no usable words.")
+        await safe_send(summary_channel, f"`{list_name}` has no usable words.")
         return
 
-    if len(cleaned_codes) > MAX_CODES_PER_LIST:
-        cleaned_codes = cleaned_codes[:MAX_CODES_PER_LIST]
+    cleaned_codes = cleaned_codes[:MAX_CODES_PER_LIST]
 
     check_state["running"] = True
     check_state["stop_requested"] = False
@@ -318,13 +312,12 @@ async def run_list_check(list_name: str, list_data: dict, manual_ctx=None):
     error_count = 0
     added_count = 0
     removed_count = 0
+    valid_found = []
 
     status_msg = await safe_send(
-        output_channel,
+        summary_channel,
         f"Checking `{list_name}` — `{len(cleaned_codes)}` word(s)..."
     )
-
-    valid_found = []
 
     try:
         for index, code in enumerate(cleaned_codes, start=1):
@@ -334,11 +327,10 @@ async def run_list_check(list_name: str, list_data: dict, manual_ctx=None):
                 break
 
             result, payload = await fetch_invite_status(code)
+            length = len(code)
 
             if result == "stopped":
                 break
-
-            length = len(code)
 
             if result == "valid":
                 valid_count += 1
@@ -347,17 +339,25 @@ async def run_list_check(list_name: str, list_data: dict, manual_ctx=None):
                 if code in invalid_cache[length]:
                     if remove_invalid(code):
                         removed_count += 1
+                        await safe_send(
+                            log_channel,
+                            f"`discord.gg/{code}` became valid again and was removed from invalid files."
+                        )
 
-                await safe_send(output_channel, f"discord.gg/{code}")
+                await safe_send(claim_channel, f"discord.gg/{code}")
 
             elif result == "invalid":
                 invalid_count += 1
 
-                if add_invalid(code):
+                was_added = add_invalid(code)
+
+                if was_added:
                     added_count += 1
+                    await safe_send(log_channel, f"{length} letters | Invalid: `discord.gg/{code}`")
 
             else:
                 error_count += 1
+                await safe_send(log_channel, f"Error checking `discord.gg/{code}`: `{payload}`")
 
             if status_msg and (index == 1 or index % 10 == 0 or index == len(cleaned_codes)):
                 try:
@@ -387,15 +387,13 @@ async def run_list_check(list_name: str, list_data: dict, manual_ctx=None):
             errors=error_count,
             added=added_count,
             removed=removed_count,
-            stopped=stopped
+            stopped=stopped,
+            updated_at=list_data.get("updated_at")
         )
 
-        ping_text = ""
+        ping_text = f"<@&{ping_role_id}> " if ping_role_id else ""
 
-        if ping_role_id:
-            ping_text = f"<@&{ping_role_id}> "
-
-        await safe_send(output_channel, content=ping_text, embed=embed)
+        await safe_send(summary_channel, content=ping_text, embed=embed)
 
         if valid_found:
             valid_file = DATA_DIR / f"{list_name}_valid_found.txt"
@@ -405,7 +403,7 @@ async def run_list_check(list_name: str, list_data: dict, manual_ctx=None):
                     f.write(f"discord.gg/{code}\n")
 
             await safe_send(
-                output_channel,
+                claim_channel,
                 content=f"Valid words found for `{list_name}`:",
                 file=discord.File(str(valid_file), filename=valid_file.name)
             )
@@ -428,25 +426,15 @@ async def run_all_checks(manual_ctx=None):
 
     load_invalid_cache()
 
-    lists = config.get("lists", {})
-
-    if not lists:
+    if not config["lists"]:
         if manual_ctx:
-            await manual_ctx.send("No saved lists found. Use `!addlist` first.")
+            await manual_ctx.send("No saved lists found.")
         return
 
-    for list_name, list_data in lists.items():
-        if check_state["stop_requested"]:
-            break
-
+    for list_name, list_data in config["lists"].items():
         await run_list_check(list_name, list_data, manual_ctx=manual_ctx)
-
         await asyncio.sleep(3)
 
-
-# =========================
-# AUTO CHECK LOOP
-# =========================
 
 @tasks.loop(minutes=1)
 async def auto_check_loop():
@@ -465,37 +453,41 @@ async def auto_check_loop():
 
     auto_check_loop.counter = 0
 
-    if check_state["running"]:
-        return
+    if not check_state["running"]:
+        await run_all_checks()
 
-    await run_all_checks()
-
-
-# =========================
-# COMMANDS
-# =========================
 
 @bot.command(name="help")
 async def help_command(ctx):
     embed = discord.Embed(
         title="Vanity Checker Help",
-        description="Saved list checker with automatic checking, role pings, and per-list channels.",
+        description="Multi-list vanity checker with claim, log, and summary channels.",
         color=discord.Color.blurple()
     )
 
     embed.add_field(
-        name="List Setup",
+        name="Setup",
         value=(
-            "`!addlist <name> <channel> <ping_role> <words>`\n"
-            "`!removelist <name>`\n"
-            "`!clearlists`\n"
-            "`!lists`"
+            "`!addlist <name> <claim_channel> <log_channel> <summary_channel> <ping_role> <words>`\n\n"
+            "Example:\n"
+            "`!addlist 4letters #claims #vanity-logs #summaries @Hunters love, hate, void, glow`"
         ),
         inline=False
     )
 
     embed.add_field(
-        name="Checking",
+        name="Manage Lists",
+        value=(
+            "`!lists`\n"
+            "`!listinfo <name>`\n"
+            "`!removelist <name>`\n"
+            "`!clearlists`"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="Checks",
         value=(
             "`!checklist <name>`\n"
             "`!checkall`\n"
@@ -505,31 +497,11 @@ async def help_command(ctx):
     )
 
     embed.add_field(
-        name="Automatic Checks",
+        name="Auto Checks",
         value=(
             "`!autocheck <minutes>`\n"
             "`!autostop`\n"
             "`!autostatus`"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="Invalid Files",
-        value=(
-            "`!getinvalid <length>`\n"
-            "`!invalidcount <length>`\n"
-            "`!clearinvalid [length]`"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="Example",
-        value=(
-            "`!addlist 4letters #claims @Hunters love, hate, void, glow`\n"
-            "`!autocheck 30`\n\n"
-            "This checks every 30 minutes and pings the role when each list finishes."
         ),
         inline=False
     )
@@ -539,7 +511,16 @@ async def help_command(ctx):
 
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def addlist(ctx, name: str, channel: discord.TextChannel, ping_role: discord.Role, *, words: str):
+async def addlist(
+    ctx,
+    name: str,
+    claim_channel: discord.TextChannel,
+    log_channel: discord.TextChannel,
+    summary_channel: discord.TextChannel,
+    ping_role: discord.Role,
+    *,
+    words: str
+):
     cleaned = parse_words(words)
 
     if not cleaned:
@@ -550,19 +531,86 @@ async def addlist(ctx, name: str, channel: discord.TextChannel, ping_role: disco
         await ctx.send(f"Too many words. Max per list is `{MAX_CODES_PER_LIST}`.")
         return
 
-    config["lists"][name.lower()] = {
-        "channel_id": channel.id,
+    name = name.lower()
+    timestamp = now_iso()
+
+    old_created = config["lists"].get(name, {}).get("created_at", timestamp)
+
+    config["lists"][name] = {
+        "claim_channel_id": claim_channel.id,
+        "log_channel_id": log_channel.id,
+        "summary_channel_id": summary_channel.id,
         "ping_role_id": ping_role.id,
-        "words": cleaned
+        "words": cleaned,
+        "created_at": old_created,
+        "updated_at": timestamp
     }
 
     save_config()
 
     await ctx.send(
-        f"Saved list `{name.lower()}` with `{len(cleaned)}` word(s).\n"
-        f"Output channel: {channel.mention}\n"
-        f"Ping role when done: {ping_role.mention}"
+        f"Saved list `{name}` with `{len(cleaned)}` word(s).\n"
+        f"Claims: {claim_channel.mention}\n"
+        f"Logs: {log_channel.mention}\n"
+        f"Summaries: {summary_channel.mention}\n"
+        f"Ping role: {ping_role.mention}\n"
+        f"Updated: {format_time(timestamp)}"
     )
+
+
+@bot.command()
+async def lists(ctx):
+    if not config["lists"]:
+        await ctx.send("No saved lists yet.")
+        return
+
+    embed = discord.Embed(title="Saved Vanity Lists", color=discord.Color.blurple())
+
+    for name, data in config["lists"].items():
+        embed.add_field(
+            name=name,
+            value=(
+                f"Words: `{len(data.get('words', []))}`\n"
+                f"Claims: <#{data.get('claim_channel_id')}>\n"
+                f"Logs: <#{data.get('log_channel_id')}>\n"
+                f"Summaries: <#{data.get('summary_channel_id')}>\n"
+                f"Ping: <@&{data.get('ping_role_id')}>\n"
+                f"Updated: {format_time(data.get('updated_at'))}"
+            ),
+            inline=False
+        )
+
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+async def listinfo(ctx, name: str):
+    name = name.lower()
+
+    if name not in config["lists"]:
+        await ctx.send(f"No list named `{name}` exists.")
+        return
+
+    data = config["lists"][name]
+
+    embed = discord.Embed(title=f"List Info: {name}", color=discord.Color.blurple())
+
+    embed.add_field(name="Words", value=str(len(data.get("words", []))), inline=True)
+    embed.add_field(name="Created", value=format_time(data.get("created_at")), inline=False)
+    embed.add_field(name="Last Updated", value=format_time(data.get("updated_at")), inline=False)
+
+    embed.add_field(name="Claim Channel", value=f"<#{data.get('claim_channel_id')}>", inline=True)
+    embed.add_field(name="Log Channel", value=f"<#{data.get('log_channel_id')}>", inline=True)
+    embed.add_field(name="Summary Channel", value=f"<#{data.get('summary_channel_id')}>", inline=True)
+    embed.add_field(name="Ping Role", value=f"<@&{data.get('ping_role_id')}>", inline=True)
+
+    preview = ", ".join(data.get("words", [])[:25])
+    if len(data.get("words", [])) > 25:
+        preview += "..."
+
+    embed.add_field(name="Word Preview", value=preview or "None", inline=False)
+
+    await ctx.send(embed=embed)
 
 
 @bot.command()
@@ -590,48 +638,12 @@ async def clearlists(ctx):
 
 
 @bot.command()
-async def lists(ctx):
-    if not config["lists"]:
-        await ctx.send("No saved lists yet.")
-        return
-
-    embed = discord.Embed(
-        title="Saved Vanity Lists",
-        color=discord.Color.blurple()
-    )
-
-    for name, data in config["lists"].items():
-        channel_id = data.get("channel_id")
-        role_id = data.get("ping_role_id")
-        words = data.get("words", [])
-
-        embed.add_field(
-            name=name,
-            value=(
-                f"Channel: <#{channel_id}>\n"
-                f"Ping Role: <@&{role_id}>\n"
-                f"Words: `{len(words)}`"
-            ),
-            inline=False
-        )
-
-    await ctx.send(embed=embed)
-
-
-@bot.command()
 @commands.has_permissions(administrator=True)
 async def checklist(ctx, name: str):
     name = name.lower()
 
     if name not in config["lists"]:
         await ctx.send(f"No list named `{name}` exists.")
-        return
-
-    if check_state["running"]:
-        await ctx.send(
-            f"A check is already running: `{check_state['mode']}` "
-            f"`{check_state['current']}/{check_state['total']}`"
-        )
         return
 
     await ctx.send(f"Starting check for `{name}`.")
@@ -686,12 +698,9 @@ async def autostop(ctx):
 
 @bot.command()
 async def autostatus(ctx):
-    enabled = config.get("auto_enabled", False)
-    minutes = config.get("auto_minutes", 60)
-
     await ctx.send(
-        f"Auto checks: `{'Enabled' if enabled else 'Disabled'}`\n"
-        f"Interval: `{minutes}` minute(s)\n"
+        f"Auto checks: `{'Enabled' if config['auto_enabled'] else 'Disabled'}`\n"
+        f"Interval: `{config['auto_minutes']}` minute(s)\n"
         f"Saved lists: `{len(config['lists'])}`\n"
         f"Currently running: `{'Yes' if check_state['running'] else 'No'}`"
     )
@@ -750,19 +759,11 @@ async def clearinvalid(ctx, length: int = None):
 @bot.command()
 @commands.has_permissions(manage_messages=True)
 async def purge(ctx, amount: int):
-    if amount < 1:
-        await ctx.send("Use a number above 0.")
-        return
-
     deleted = await ctx.channel.purge(limit=amount + 1)
     msg = await ctx.send(f"Deleted `{len(deleted) - 1}` messages.")
     await asyncio.sleep(3)
     await msg.delete()
 
-
-# =========================
-# EVENTS
-# =========================
 
 @bot.event
 async def on_ready():
@@ -775,9 +776,6 @@ async def on_ready():
         auto_check_loop.start()
 
     logger.info("Logged in as %s", bot.user)
-    logger.info("Auto enabled: %s", config["auto_enabled"])
-    logger.info("Auto minutes: %s", config["auto_minutes"])
-    logger.info("Saved lists: %s", len(config["lists"]))
 
 
 if not TOKEN:
