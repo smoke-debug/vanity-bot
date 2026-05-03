@@ -29,6 +29,7 @@ logger = logging.getLogger("vanity_checker")
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.guilds = True
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
@@ -251,6 +252,26 @@ async def fetch_invite_status(code):
     return "error", "Unknown error"
 
 
+def find_role(ctx, role_input):
+    role_input = role_input.strip()
+
+    if role_input.startswith("<@&") and role_input.endswith(">"):
+        role_id = role_input.replace("<@&", "").replace(">", "")
+        if role_id.isdigit():
+            return ctx.guild.get_role(int(role_id))
+
+    if role_input.isdigit():
+        return ctx.guild.get_role(int(role_input))
+
+    lowered = role_input.lower()
+
+    for role in ctx.guild.roles:
+        if role.name.lower() == lowered:
+            return role
+
+    return None
+
+
 def build_summary_embed(list_name, processed, valid, invalid, errors, added, removed, stopped, updated_at):
     embed = discord.Embed(
         title=f"{'Check Stopped' if stopped else 'Check Finished'}: {list_name}",
@@ -258,8 +279,8 @@ def build_summary_embed(list_name, processed, valid, invalid, errors, added, rem
     )
 
     embed.add_field(name="Processed", value=str(processed), inline=True)
-    embed.add_field(name="Valid", value=str(valid), inline=True)
-    embed.add_field(name="Invalid", value=str(invalid), inline=True)
+    embed.add_field(name="Valid / Not Taken", value=str(valid), inline=True)
+    embed.add_field(name="Invalid / Taken", value=str(invalid), inline=True)
     embed.add_field(name="Errors", value=str(errors), inline=True)
     embed.add_field(name="Added Invalid", value=str(added), inline=True)
     embed.add_field(name="Removed Invalid", value=str(removed), inline=True)
@@ -268,6 +289,32 @@ def build_summary_embed(list_name, processed, valid, invalid, errors, added, rem
     embed.set_footer(text="Vanity checker")
 
     return embed
+
+
+async def send_copy_paste_words(channel, list_name, valid_found):
+    if not valid_found:
+        await safe_send(channel, f"No available words found for `{list_name}`.")
+        return
+
+    paragraph = ", ".join(valid_found)
+
+    if len(paragraph) <= 1900:
+        await safe_send(
+            channel,
+            f"Available words for `{list_name}`:\n```txt\n{paragraph}\n```"
+        )
+        return
+
+    file_path = DATA_DIR / f"{list_name}_available_words.txt"
+
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(paragraph)
+
+    await safe_send(
+        channel,
+        content=f"Available words for `{list_name}` were too long for one message, so here is the txt file:",
+        file=discord.File(str(file_path), filename=file_path.name)
+    )
 
 
 async def run_list_check(list_name, list_data, manual_ctx=None):
@@ -341,7 +388,7 @@ async def run_list_check(list_name, list_data, manual_ctx=None):
                         removed_count += 1
                         await safe_send(
                             log_channel,
-                            f"`discord.gg/{code}` became valid again and was removed from invalid files."
+                            f"`discord.gg/{code}` became available again and was removed from invalid files."
                         )
 
                 await safe_send(claim_channel, f"discord.gg/{code}")
@@ -353,7 +400,7 @@ async def run_list_check(list_name, list_data, manual_ctx=None):
 
                 if was_added:
                     added_count += 1
-                    await safe_send(log_channel, f"{length} letters | Invalid: `discord.gg/{code}`")
+                    await safe_send(log_channel, f"{length} letters | Taken/invalid: `discord.gg/{code}`")
 
             else:
                 error_count += 1
@@ -365,7 +412,7 @@ async def run_list_check(list_name, list_data, manual_ctx=None):
                         content=(
                             f"Checking `{list_name}`...\n"
                             f"Progress: `{index}/{len(cleaned_codes)}`\n"
-                            f"Valid: `{valid_count}` | Invalid: `{invalid_count}` | Errors: `{error_count}`"
+                            f"Available: `{valid_count}` | Taken: `{invalid_count}` | Errors: `{error_count}`"
                         )
                     )
                 except Exception:
@@ -378,6 +425,8 @@ async def run_list_check(list_name, list_data, manual_ctx=None):
 
     finally:
         stopped = check_state["stop_requested"]
+
+        await send_copy_paste_words(claim_channel, list_name, valid_found)
 
         embed = build_summary_embed(
             list_name=list_name,
@@ -394,19 +443,6 @@ async def run_list_check(list_name, list_data, manual_ctx=None):
         ping_text = f"<@&{ping_role_id}> " if ping_role_id else ""
 
         await safe_send(summary_channel, content=ping_text, embed=embed)
-
-        if valid_found:
-            valid_file = DATA_DIR / f"{list_name}_valid_found.txt"
-
-            with open(valid_file, "w", encoding="utf-8") as f:
-                for code in valid_found:
-                    f.write(f"discord.gg/{code}\n")
-
-            await safe_send(
-                claim_channel,
-                content=f"Valid words found for `{list_name}`:",
-                file=discord.File(str(valid_file), filename=valid_file.name)
-            )
 
         check_state["running"] = False
         check_state["stop_requested"] = False
@@ -461,7 +497,7 @@ async def auto_check_loop():
 async def help_command(ctx):
     embed = discord.Embed(
         title="Vanity Checker Help",
-        description="Multi-list vanity checker with claim, log, and summary channels.",
+        description="Multi-list vanity checker with claims, logs, summaries, auto checks, and copy/paste available-word messages.",
         color=discord.Color.blurple()
     )
 
@@ -470,39 +506,33 @@ async def help_command(ctx):
         value=(
             "`!addlist <name> <claim_channel> <log_channel> <summary_channel> <ping_role> <words>`\n\n"
             "Example:\n"
-            "`!addlist 4letters #claims #vanity-logs #summaries @Hunters love, hate, void, glow`"
+            "`!addlist 4letters #claims #vanity-logs #summaries @Hunters love, hate, void, glow`\n\n"
+            "Role can be a mention, ID, or exact role name."
         ),
         inline=False
     )
 
     embed.add_field(
         name="Manage Lists",
-        value=(
-            "`!lists`\n"
-            "`!listinfo <name>`\n"
-            "`!removelist <name>`\n"
-            "`!clearlists`"
-        ),
+        value="`!lists`\n`!listinfo <name>`\n`!removelist <name>`\n`!clearlists`",
         inline=False
     )
 
     embed.add_field(
         name="Checks",
-        value=(
-            "`!checklist <name>`\n"
-            "`!checkall`\n"
-            "`!stop`"
-        ),
+        value="`!checklist <name>`\n`!checkall`\n`!stop`",
         inline=False
     )
 
     embed.add_field(
         name="Auto Checks",
-        value=(
-            "`!autocheck <minutes>`\n"
-            "`!autostop`\n"
-            "`!autostatus`"
-        ),
+        value="`!autocheck <minutes>`\n`!autostop`\n`!autostatus`",
+        inline=False
+    )
+
+    embed.add_field(
+        name="Invalid Files",
+        value="`!invalidcount <length>`\n`!getinvalid <length>`\n`!clearinvalid [length]`",
         inline=False
     )
 
@@ -517,7 +547,7 @@ async def addlist(
     claim_channel: discord.TextChannel,
     log_channel: discord.TextChannel,
     summary_channel: discord.TextChannel,
-    ping_role: discord.Role,
+    ping_role_input: str,
     *,
     words: str
 ):
@@ -529,6 +559,15 @@ async def addlist(
 
     if len(cleaned) > MAX_CODES_PER_LIST:
         await ctx.send(f"Too many words. Max per list is `{MAX_CODES_PER_LIST}`.")
+        return
+
+    ping_role = find_role(ctx, ping_role_input)
+
+    if not ping_role:
+        await ctx.send(
+            "I could not find that ping role.\n"
+            "Use a role mention like `@Hunters`, a role ID, or the exact role name."
+        )
         return
 
     name = name.lower()
@@ -598,7 +637,6 @@ async def listinfo(ctx, name: str):
     embed.add_field(name="Words", value=str(len(data.get("words", []))), inline=True)
     embed.add_field(name="Created", value=format_time(data.get("created_at")), inline=False)
     embed.add_field(name="Last Updated", value=format_time(data.get("updated_at")), inline=False)
-
     embed.add_field(name="Claim Channel", value=f"<#{data.get('claim_channel_id')}>", inline=True)
     embed.add_field(name="Log Channel", value=f"<#{data.get('log_channel_id')}>", inline=True)
     embed.add_field(name="Summary Channel", value=f"<#{data.get('summary_channel_id')}>", inline=True)
