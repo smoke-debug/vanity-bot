@@ -1,92 +1,99 @@
 import os
+import json
 import asyncio
 import logging
 from pathlib import Path
 from collections import defaultdict
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
-# =========================
-# CONFIG
-# =========================
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-SEND_CHANNEL_ID = 1491717657567690802
-INVALID_LOG_CHANNEL_ID = 1491717674349367386
-
+PREFIX = "!"
 DELAY_SECONDS = 3
-MAX_CODES_PER_RUN = 1000
-BACKOFF_SECONDS = 60
 MAX_RETRIES = 2
+BACKOFF_SECONDS = 60
+MAX_CODES_PER_LIST = 1000
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data" / "invalid_vanities"
+DATA_DIR = BASE_DIR / "data"
+INVALID_DIR = DATA_DIR / "invalid_vanities"
+CONFIG_FILE = DATA_DIR / "vanity_config.json"
+
 TRACKED_LENGTHS = range(1, 33)
 
-# =========================
-# LOGGING
-# =========================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
 logger = logging.getLogger("vanity_checker")
 
-# =========================
-# BOT SETUP
-# =========================
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(
-    command_prefix="!",
-    intents=intents,
-    help_command=None
-)
+bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
-# =========================
-# RUNTIME STATE
-# =========================
 invalid_cache = defaultdict(set)
 
 check_state = {
     "running": False,
     "stop_requested": False,
-    "started_by": None,
-    "total": 0,
     "current": 0,
+    "total": 0,
+    "mode": None,
+}
+
+config = {
+    "auto_enabled": False,
+    "auto_minutes": 60,
+    "lists": {}
 }
 
 
 # =========================
 # FILE HELPERS
 # =========================
-def ensure_data_dir() -> None:
+
+def ensure_dirs():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    INVALID_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def get_invalid_file_path(length: int) -> Path:
-    ensure_data_dir()
-    return DATA_DIR / f"invalid_{length}_letters.txt"
+def save_config():
+    ensure_dirs()
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=4)
 
 
-def ensure_invalid_file(length: int) -> Path:
-    file_path = get_invalid_file_path(length)
-    if not file_path.exists():
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.touch(exist_ok=True)
-        logger.info("Created missing file: %s", file_path)
-    return file_path
+def load_config():
+    global config
+    ensure_dirs()
+
+    if not CONFIG_FILE.exists():
+        save_config()
+        return
+
+    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        loaded = json.load(f)
+
+    config["auto_enabled"] = loaded.get("auto_enabled", False)
+    config["auto_minutes"] = loaded.get("auto_minutes", 60)
+    config["lists"] = loaded.get("lists", {})
 
 
-def ensure_all_invalid_files() -> None:
-    ensure_data_dir()
+def invalid_file(length: int) -> Path:
+    ensure_dirs()
+    return INVALID_DIR / f"invalid_{length}_letters.txt"
+
+
+def ensure_invalid_files():
+    ensure_dirs()
     for length in TRACKED_LENGTHS:
-        ensure_invalid_file(length)
+        invalid_file(length).touch(exist_ok=True)
 
 
-def clean_invite_code(item: str) -> str:
+def clean_code(item: str) -> str:
     return (
         str(item)
         .replace("https://discord.gg/", "")
@@ -97,336 +104,597 @@ def clean_invite_code(item: str) -> str:
         .replace("discord.com/invite/", "")
         .strip()
         .strip("/")
+        .lower()
     )
 
 
-def normalize_code(code: str) -> str:
-    return clean_invite_code(code).strip().lower()
-
-
-def load_invalid_cache() -> None:
+def load_invalid_cache():
     invalid_cache.clear()
-    ensure_all_invalid_files()
+    ensure_invalid_files()
 
     for length in TRACKED_LENGTHS:
-        file_path = ensure_invalid_file(length)
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    code = normalize_code(line)
-                    if code and len(code) == length:
-                        invalid_cache[length].add(code)
-        except Exception as e:
-            logger.exception("Failed to read %s: %s", file_path, e)
-
-    logger.info("Loaded invalid cache from files.")
+        path = invalid_file(length)
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                code = clean_code(line)
+                if code and len(code) == length:
+                    invalid_cache[length].add(code)
 
 
-def rewrite_invalid_file(length: int) -> bool:
-    try:
-        file_path = ensure_invalid_file(length)
-        codes = sorted(invalid_cache[length])
-
-        with open(file_path, "w", encoding="utf-8", newline="\n") as f:
-            for code in codes:
-                f.write(f"{code}\n")
-            f.flush()
-            os.fsync(f.fileno())
-
-        logger.info("Rewrote file %s with %s codes.", file_path, len(codes))
-        return True
-    except Exception as e:
-        logger.exception("Failed rewriting invalid file for %s letters: %s", length, e)
-        return False
+def rewrite_invalid_file(length: int):
+    path = invalid_file(length)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        for code in sorted(invalid_cache[length]):
+            f.write(code + "\n")
 
 
-def rewrite_all_invalid_files() -> None:
-    ensure_all_invalid_files()
-    for length in TRACKED_LENGTHS:
-        rewrite_invalid_file(length)
-
-
-def add_invalid_code(code: str) -> bool:
-    code = normalize_code(code)
-    if not code:
-        return False
-
+def add_invalid(code: str):
+    code = clean_code(code)
     length = len(code)
+
     if length not in TRACKED_LENGTHS:
         return False
 
+    before = len(invalid_cache[length])
     invalid_cache[length].add(code)
-    return rewrite_invalid_file(length)
+
+    if len(invalid_cache[length]) != before:
+        rewrite_invalid_file(length)
+        return True
+
+    return False
 
 
-def remove_invalid_code(code: str) -> bool:
-    code = normalize_code(code)
-    if not code:
-        return False
-
+def remove_invalid(code: str):
+    code = clean_code(code)
     length = len(code)
+
     if length not in TRACKED_LENGTHS:
         return False
 
     if code in invalid_cache[length]:
         invalid_cache[length].remove(code)
-        logger.info("Removed code from invalid cache: %s", code)
-        return rewrite_invalid_file(length)
+        rewrite_invalid_file(length)
+        return True
 
-    return True
-
-
-def get_invalid_count(length: int) -> int:
-    return len(invalid_cache[length])
-
-
-# =========================
-# CHECK STATE HELPERS
-# =========================
-def reset_check_state() -> None:
-    check_state["running"] = False
-    check_state["stop_requested"] = False
-    check_state["started_by"] = None
-    check_state["total"] = 0
-    check_state["current"] = 0
-
-
-def start_check_state(user_id: int, total: int) -> None:
-    check_state["running"] = True
-    check_state["stop_requested"] = False
-    check_state["started_by"] = user_id
-    check_state["total"] = total
-    check_state["current"] = 0
-
-
-def request_stop() -> bool:
-    if not check_state["running"]:
-        return False
-    check_state["stop_requested"] = True
-    return True
-
-
-async def sleep_with_stop(seconds: float, chunk: float = 0.5) -> bool:
-    remaining = max(0.0, float(seconds))
-    while remaining > 0:
-        if check_state["stop_requested"]:
-            return True
-        step = min(chunk, remaining)
-        await asyncio.sleep(step)
-        remaining -= step
-    return check_state["stop_requested"]
+    return False
 
 
 # =========================
 # DISCORD HELPERS
 # =========================
-async def get_channel_safe(channel_id: int):
+
+async def get_channel(channel_id: int):
     channel = bot.get_channel(channel_id)
-    if channel is not None:
+
+    if channel:
         return channel
 
     try:
         return await bot.fetch_channel(channel_id)
-    except Exception as e:
-        logger.exception("Failed to get channel %s: %s", channel_id, e)
+    except Exception:
         return None
 
 
-async def safe_fetch_invite(invite_code: str):
-    """
-    Returns:
-        ("valid", invite)
-        ("invalid", None)
-        ("temporary_error", error_text)
-        ("fatal_error", error_text)
-        ("stopped", None)
-    """
+async def safe_send(channel, content=None, embed=None, file=None):
+    try:
+        return await channel.send(content=content, embed=embed, file=file)
+    except Exception as e:
+        logger.warning("Failed sending message: %s", e)
+        return None
+
+
+async def sleep_with_stop(seconds: float):
+    waited = 0
+
+    while waited < seconds:
+        if check_state["stop_requested"]:
+            return True
+
+        await asyncio.sleep(0.5)
+        waited += 0.5
+
+    return False
+
+
+async def fetch_invite_status(code: str):
     for attempt in range(1, MAX_RETRIES + 1):
         if check_state["stop_requested"]:
             return "stopped", None
 
         try:
-            invite = await bot.fetch_invite(invite_code)
+            invite = await bot.fetch_invite(code)
             return "valid", invite
 
         except discord.NotFound:
             return "invalid", None
 
         except discord.Forbidden as e:
-            return "fatal_error", f"Forbidden: {e}"
+            return "fatal", str(e)
 
         except discord.HTTPException as e:
-            logger.warning(
-                "HTTPException on %s (attempt %s/%s): %s",
-                invite_code, attempt, MAX_RETRIES, e
-            )
+            logger.warning("HTTP error on %s attempt %s/%s: %s", code, attempt, MAX_RETRIES, e)
+
             if attempt < MAX_RETRIES:
                 stopped = await sleep_with_stop(BACKOFF_SECONDS * attempt)
                 if stopped:
                     return "stopped", None
                 continue
-            return "temporary_error", f"HTTPException: {e}"
+
+            return "error", str(e)
 
         except Exception as e:
-            logger.exception("Unexpected error on %s: %s", invite_code, e)
-            if attempt < MAX_RETRIES:
-                stopped = await sleep_with_stop(BACKOFF_SECONDS * attempt)
-                if stopped:
-                    return "stopped", None
-                continue
-            return "temporary_error", f"{type(e).__name__}: {e}"
+            logger.exception("Unexpected error on %s", code)
+            return "error", str(e)
 
-    return "temporary_error", "Unknown error"
+    return "error", "Unknown error"
 
 
-def build_help_embed(prefix: str = "!") -> discord.Embed:
+def parse_words(words: str):
+    seen = set()
+    cleaned = []
+
+    for item in words.split(","):
+        code = clean_code(item)
+
+        if not code:
+            continue
+
+        if code in seen:
+            continue
+
+        seen.add(code)
+        cleaned.append(code)
+
+    return cleaned
+
+
+def build_summary_embed(list_name, processed, valid, invalid, errors, added, removed, stopped):
+    title = f"Check Finished: {list_name}"
+
+    if stopped:
+        title = f"Check Stopped: {list_name}"
+
     embed = discord.Embed(
-        title="Vanity Checker Help",
-        description=(
-            "This bot checks Discord vanity invite codes, sends valid ones to your valid log channel, "
-            "sends invalid ones to your invalid log channel, and stores invalid ones in txt files grouped by code length."
-        ),
-        color=discord.Color.blurple()
+        title=title,
+        color=discord.Color.green() if not stopped else discord.Color.orange()
     )
 
-    embed.add_field(
-        name=f"{prefix}sendcodes <codes>",
-        value=(
-            "Checks a comma-separated list of vanity codes or invite links.\n\n"
-            "**Example:**\n"
-            f"`{prefix}sendcodes abc, test, discord.gg/cool, https://discord.gg/name`\n\n"
-            "**What it does:**\n"
-            "• Cleans input into plain invite codes\n"
-            "• Checks each code slowly to avoid rate limits\n"
-            "• Sends valid codes to the valid log channel\n"
-            "• Sends invalid codes to the invalid log channel\n"
-            "• Immediately writes invalid txt files when changes happen\n"
-            "• Removes codes from txt files if they become valid\n"
-            "• Prevents duplicate input in the same run"
-        ),
-        inline=False
-    )
+    embed.add_field(name="Processed", value=str(processed), inline=True)
+    embed.add_field(name="Valid", value=str(valid), inline=True)
+    embed.add_field(name="Invalid", value=str(invalid), inline=True)
+    embed.add_field(name="Errors", value=str(errors), inline=True)
+    embed.add_field(name="Added Invalid", value=str(added), inline=True)
+    embed.add_field(name="Removed Invalid", value=str(removed), inline=True)
 
-    embed.add_field(
-        name=f"{prefix}clearinvalid [length]",
-        value=(
-            "Clears invalid txt files so you can rebuild them from scratch.\n\n"
-            f"**Examples:**\n"
-            f"`{prefix}clearinvalid` → clears all invalid files\n"
-            f"`{prefix}clearinvalid 4` → clears only the 4-letter invalid file"
-        ),
-        inline=False
-    )
+    embed.set_footer(text="Automatic vanity checker")
 
-    embed.add_field(
-        name=f"{prefix}getinvalid <length>",
-        value=(
-            "Rewrites and sends the invalid txt file for a specific code length.\n\n"
-            f"Examples: `{prefix}getinvalid 3`, `{prefix}getinvalid 4`, `{prefix}getinvalid 5`"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name=f"{prefix}invalidcount <length>",
-        value="Shows how many invalid codes are currently in memory for that length.",
-        inline=False
-    )
-
-    embed.add_field(
-        name=f"{prefix}stop",
-        value="Stops the current running `sendcodes` scan safely.",
-        inline=False
-    )
-
-    embed.add_field(
-        name=f"{prefix}invalidfiles",
-        value="Shows where the invalid txt files are stored and lists the files currently available.",
-        inline=False
-    )
-
-    embed.add_field(
-        name=f"{prefix}remakeinvalidfiles",
-        value="Recreates any missing invalid txt files and rewrites them from cache.",
-        inline=False
-    )
-
-    embed.add_field(
-        name=f"{prefix}purge <amount>",
-        value=f"Deletes messages from the current channel. Example: `{prefix}purge 50`",
-        inline=False
-    )
-
-    embed.set_footer(
-        text="Tip: invalid files are stored in data/invalid_vanities next to your bot file."
-    )
     return embed
 
 
 # =========================
-# EVENTS
+# CHECK ENGINE
 # =========================
-@bot.event
-async def on_ready():
-    ensure_all_invalid_files()
+
+async def run_list_check(list_name: str, list_data: dict, manual_ctx=None):
+    words = list_data.get("words", [])
+    channel_id = int(list_data.get("channel_id"))
+    ping_role_id = list_data.get("ping_role_id")
+
+    output_channel = await get_channel(channel_id)
+
+    if not output_channel:
+        if manual_ctx:
+            await manual_ctx.send(f"Could not access the channel for list `{list_name}`.")
+        return
+
+    cleaned_codes = []
+
+    seen = set()
+    for word in words:
+        code = clean_code(word)
+
+        if not code or code in seen:
+            continue
+
+        seen.add(code)
+        cleaned_codes.append(code)
+
+    if not cleaned_codes:
+        await safe_send(output_channel, f"`{list_name}` has no usable words.")
+        return
+
+    if len(cleaned_codes) > MAX_CODES_PER_LIST:
+        cleaned_codes = cleaned_codes[:MAX_CODES_PER_LIST]
+
+    check_state["running"] = True
+    check_state["stop_requested"] = False
+    check_state["current"] = 0
+    check_state["total"] = len(cleaned_codes)
+    check_state["mode"] = list_name
+
+    valid_count = 0
+    invalid_count = 0
+    error_count = 0
+    added_count = 0
+    removed_count = 0
+
+    status_msg = await safe_send(
+        output_channel,
+        f"Checking `{list_name}` — `{len(cleaned_codes)}` word(s)..."
+    )
+
+    valid_found = []
+
+    try:
+        for index, code in enumerate(cleaned_codes, start=1):
+            check_state["current"] = index
+
+            if check_state["stop_requested"]:
+                break
+
+            result, payload = await fetch_invite_status(code)
+
+            if result == "stopped":
+                break
+
+            length = len(code)
+
+            if result == "valid":
+                valid_count += 1
+                valid_found.append(code)
+
+                if code in invalid_cache[length]:
+                    if remove_invalid(code):
+                        removed_count += 1
+
+                await safe_send(output_channel, f"discord.gg/{code}")
+
+            elif result == "invalid":
+                invalid_count += 1
+
+                if add_invalid(code):
+                    added_count += 1
+
+            else:
+                error_count += 1
+
+            if status_msg and (index == 1 or index % 10 == 0 or index == len(cleaned_codes)):
+                try:
+                    await status_msg.edit(
+                        content=(
+                            f"Checking `{list_name}`...\n"
+                            f"Progress: `{index}/{len(cleaned_codes)}`\n"
+                            f"Valid: `{valid_count}` | Invalid: `{invalid_count}` | Errors: `{error_count}`"
+                        )
+                    )
+                except Exception:
+                    pass
+
+            if index < len(cleaned_codes):
+                stopped = await sleep_with_stop(DELAY_SECONDS)
+                if stopped:
+                    break
+
+    finally:
+        stopped = check_state["stop_requested"]
+
+        embed = build_summary_embed(
+            list_name=list_name,
+            processed=check_state["current"],
+            valid=valid_count,
+            invalid=invalid_count,
+            errors=error_count,
+            added=added_count,
+            removed=removed_count,
+            stopped=stopped
+        )
+
+        ping_text = ""
+
+        if ping_role_id:
+            ping_text = f"<@&{ping_role_id}> "
+
+        await safe_send(output_channel, content=ping_text, embed=embed)
+
+        if valid_found:
+            valid_file = DATA_DIR / f"{list_name}_valid_found.txt"
+
+            with open(valid_file, "w", encoding="utf-8") as f:
+                for code in valid_found:
+                    f.write(f"discord.gg/{code}\n")
+
+            await safe_send(
+                output_channel,
+                content=f"Valid words found for `{list_name}`:",
+                file=discord.File(str(valid_file), filename=valid_file.name)
+            )
+
+        check_state["running"] = False
+        check_state["stop_requested"] = False
+        check_state["current"] = 0
+        check_state["total"] = 0
+        check_state["mode"] = None
+
+
+async def run_all_checks(manual_ctx=None):
+    if check_state["running"]:
+        if manual_ctx:
+            await manual_ctx.send(
+                f"A check is already running: `{check_state['mode']}` "
+                f"`{check_state['current']}/{check_state['total']}`"
+            )
+        return
+
     load_invalid_cache()
-    logger.info("Logged in as %s (ID: %s)", bot.user, bot.user.id)
-    logger.info("Storage folder: %s", DATA_DIR)
-    logger.info("Bot is ready.")
+
+    lists = config.get("lists", {})
+
+    if not lists:
+        if manual_ctx:
+            await manual_ctx.send("No saved lists found. Use `!addlist` first.")
+        return
+
+    for list_name, list_data in lists.items():
+        if check_state["stop_requested"]:
+            break
+
+        await run_list_check(list_name, list_data, manual_ctx=manual_ctx)
+
+        await asyncio.sleep(3)
+
+
+# =========================
+# AUTO CHECK LOOP
+# =========================
+
+@tasks.loop(minutes=1)
+async def auto_check_loop():
+    if not config.get("auto_enabled", False):
+        return
+
+    minutes = int(config.get("auto_minutes", 60))
+
+    if not hasattr(auto_check_loop, "counter"):
+        auto_check_loop.counter = 0
+
+    auto_check_loop.counter += 1
+
+    if auto_check_loop.counter < minutes:
+        return
+
+    auto_check_loop.counter = 0
+
+    if check_state["running"]:
+        return
+
+    await run_all_checks()
 
 
 # =========================
 # COMMANDS
 # =========================
+
 @bot.command(name="help")
 async def help_command(ctx):
-    embed = build_help_embed(bot.command_prefix)
+    embed = discord.Embed(
+        title="Vanity Checker Help",
+        description="Saved list checker with automatic checking, role pings, and per-list channels.",
+        color=discord.Color.blurple()
+    )
+
+    embed.add_field(
+        name="List Setup",
+        value=(
+            "`!addlist <name> <channel> <ping_role> <words>`\n"
+            "`!removelist <name>`\n"
+            "`!clearlists`\n"
+            "`!lists`"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="Checking",
+        value=(
+            "`!checklist <name>`\n"
+            "`!checkall`\n"
+            "`!stop`"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="Automatic Checks",
+        value=(
+            "`!autocheck <minutes>`\n"
+            "`!autostop`\n"
+            "`!autostatus`"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="Invalid Files",
+        value=(
+            "`!getinvalid <length>`\n"
+            "`!invalidcount <length>`\n"
+            "`!clearinvalid [length]`"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="Example",
+        value=(
+            "`!addlist 4letters #claims @Hunters love, hate, void, glow`\n"
+            "`!autocheck 30`\n\n"
+            "This checks every 30 minutes and pings the role when each list finishes."
+        ),
+        inline=False
+    )
+
     await ctx.send(embed=embed)
+
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def addlist(ctx, name: str, channel: discord.TextChannel, ping_role: discord.Role, *, words: str):
+    cleaned = parse_words(words)
+
+    if not cleaned:
+        await ctx.send("No usable words found.")
+        return
+
+    if len(cleaned) > MAX_CODES_PER_LIST:
+        await ctx.send(f"Too many words. Max per list is `{MAX_CODES_PER_LIST}`.")
+        return
+
+    config["lists"][name.lower()] = {
+        "channel_id": channel.id,
+        "ping_role_id": ping_role.id,
+        "words": cleaned
+    }
+
+    save_config()
+
+    await ctx.send(
+        f"Saved list `{name.lower()}` with `{len(cleaned)}` word(s).\n"
+        f"Output channel: {channel.mention}\n"
+        f"Ping role when done: {ping_role.mention}"
+    )
+
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def removelist(ctx, name: str):
+    name = name.lower()
+
+    if name not in config["lists"]:
+        await ctx.send(f"No list named `{name}` exists.")
+        return
+
+    del config["lists"][name]
+    save_config()
+
+    await ctx.send(f"Removed list `{name}`.")
+
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def clearlists(ctx):
+    config["lists"] = {}
+    save_config()
+
+    await ctx.send("Removed all saved lists.")
+
+
+@bot.command()
+async def lists(ctx):
+    if not config["lists"]:
+        await ctx.send("No saved lists yet.")
+        return
+
+    embed = discord.Embed(
+        title="Saved Vanity Lists",
+        color=discord.Color.blurple()
+    )
+
+    for name, data in config["lists"].items():
+        channel_id = data.get("channel_id")
+        role_id = data.get("ping_role_id")
+        words = data.get("words", [])
+
+        embed.add_field(
+            name=name,
+            value=(
+                f"Channel: <#{channel_id}>\n"
+                f"Ping Role: <@&{role_id}>\n"
+                f"Words: `{len(words)}`"
+            ),
+            inline=False
+        )
+
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def checklist(ctx, name: str):
+    name = name.lower()
+
+    if name not in config["lists"]:
+        await ctx.send(f"No list named `{name}` exists.")
+        return
+
+    if check_state["running"]:
+        await ctx.send(
+            f"A check is already running: `{check_state['mode']}` "
+            f"`{check_state['current']}/{check_state['total']}`"
+        )
+        return
+
+    await ctx.send(f"Starting check for `{name}`.")
+    await run_list_check(name, config["lists"][name], manual_ctx=ctx)
+
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def checkall(ctx):
+    await ctx.send("Starting all saved list checks.")
+    await run_all_checks(manual_ctx=ctx)
 
 
 @bot.command()
 async def stop(ctx):
     if not check_state["running"]:
-        await ctx.send("There is no active check running right now.")
+        await ctx.send("No check is currently running.")
         return
 
-    request_stop()
+    check_state["stop_requested"] = True
+
     await ctx.send(
-        f"Stop requested. The current check will stop safely after the current step. "
-        f"Progress: {check_state['current']}/{check_state['total']}."
+        f"Stop requested for `{check_state['mode']}`. "
+        f"Progress: `{check_state['current']}/{check_state['total']}`"
     )
 
 
 @bot.command()
-async def clearinvalid(ctx, length: int = None):
-    if check_state["running"]:
-        await ctx.send("You cannot clear invalid files while a check is running. Use `!stop` first.")
+@commands.has_permissions(administrator=True)
+async def autocheck(ctx, minutes: int):
+    if minutes < 5:
+        await ctx.send("Use at least `5` minutes to avoid rate limits.")
         return
 
-    ensure_all_invalid_files()
-    load_invalid_cache()
+    config["auto_enabled"] = True
+    config["auto_minutes"] = minutes
+    save_config()
 
-    if length is None:
-        cleared = 0
-        for file_length in TRACKED_LENGTHS:
-            invalid_cache[file_length].clear()
-            if rewrite_invalid_file(file_length):
-                cleared += 1
+    auto_check_loop.counter = 0
 
-        await ctx.send(f"Cleared all invalid files. ({cleared} file(s) reset)")
-        return
+    await ctx.send(f"Automatic checks enabled every `{minutes}` minute(s).")
 
-    if length < 1 or length > 32:
-        await ctx.send("Use a length between 1 and 32.")
-        return
 
-    invalid_cache[length].clear()
-    ok = rewrite_invalid_file(length)
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def autostop(ctx):
+    config["auto_enabled"] = False
+    save_config()
 
-    if ok:
-        await ctx.send(f"Cleared the invalid file for {length} letters.")
-    else:
-        await ctx.send(f"Failed to clear the invalid file for {length} letters.")
+    await ctx.send("Automatic checks disabled.")
+
+
+@bot.command()
+async def autostatus(ctx):
+    enabled = config.get("auto_enabled", False)
+    minutes = config.get("auto_minutes", 60)
+
+    await ctx.send(
+        f"Auto checks: `{'Enabled' if enabled else 'Disabled'}`\n"
+        f"Interval: `{minutes}` minute(s)\n"
+        f"Saved lists: `{len(config['lists'])}`\n"
+        f"Currently running: `{'Yes' if check_state['running'] else 'No'}`"
+    )
 
 
 @bot.command()
@@ -436,201 +704,7 @@ async def invalidcount(ctx, length: int):
         return
 
     load_invalid_cache()
-    await ctx.send(f"{length}-letter invalid count: {get_invalid_count(length)}")
-
-
-@bot.command()
-async def sendcodes(ctx, *, words: str):
-    if check_state["running"]:
-        await ctx.send(
-            f"A check is already running right now. Progress: "
-            f"{check_state['current']}/{check_state['total']}. Use `!stop` if you want to stop it."
-        )
-        return
-
-    items = [w.strip() for w in words.split(",") if w.strip()]
-
-    if not items:
-        await ctx.send("No codes found.")
-        return
-
-    if len(items) > MAX_CODES_PER_RUN:
-        await ctx.send(f"Too many codes at once. Max per run is {MAX_CODES_PER_RUN}.")
-        return
-
-    ensure_all_invalid_files()
-    load_invalid_cache()
-
-    send_channel = await get_channel_safe(SEND_CHANNEL_ID)
-    invalid_log_channel = await get_channel_safe(INVALID_LOG_CHANNEL_ID)
-
-    if send_channel is None:
-        await ctx.send("Could not access the valid invite channel.")
-        return
-
-    if invalid_log_channel is None:
-        await ctx.send("Could not access the invalid invite channel.")
-        return
-
-    seen_input = set()
-    cleaned_codes = []
-    for item in items:
-        code = normalize_code(item)
-        if not code:
-            continue
-        if code in seen_input:
-            continue
-        seen_input.add(code)
-        cleaned_codes.append(code)
-
-    if not cleaned_codes:
-        await ctx.send("No usable codes found after cleaning.")
-        return
-
-    affected_lengths = sorted({len(code) for code in cleaned_codes})
-
-    valid_count = 0
-    invalid_count = 0
-    error_count = 0
-    added_to_invalid_count = 0
-    removed_from_invalid_count = 0
-
-    start_check_state(ctx.author.id, len(cleaned_codes))
-    status_msg = await ctx.send(
-        f"Checking {len(cleaned_codes)} code(s) slowly to avoid rate limits..."
-    )
-
-    stopped_early = False
-
-    try:
-        for index, invite_code in enumerate(cleaned_codes, start=1):
-            check_state["current"] = index
-
-            if check_state["stop_requested"]:
-                stopped_early = True
-                break
-
-            length = len(invite_code)
-            logger.info("[%s/%s] Checking: %s", index, len(cleaned_codes), invite_code)
-
-            result, payload = await safe_fetch_invite(invite_code)
-
-            if result == "stopped":
-                stopped_early = True
-                break
-
-            if result == "valid":
-                was_invalid = invite_code in invalid_cache[length]
-
-                if was_invalid:
-                    if remove_invalid_code(invite_code):
-                        removed_from_invalid_count += 1
-                        try:
-                            await invalid_log_channel.send(
-                                f"{length} letters | Removed from invalid file because it is valid now: `discord.gg/{invite_code}`"
-                            )
-                        except Exception as e:
-                            logger.exception("Failed to log removal of %s: %s", invite_code, e)
-
-                try:
-                    await send_channel.send(f"discord.gg/{invite_code}")
-                    valid_count += 1
-                except Exception as e:
-                    logger.exception("Failed to send valid code %s: %s", invite_code, e)
-                    error_count += 1
-
-            elif result == "invalid":
-                already_invalid = invite_code in invalid_cache[length]
-
-                saved_ok = add_invalid_code(invite_code)
-                if saved_ok and not already_invalid:
-                    added_to_invalid_count += 1
-
-                invalid_count += 1
-
-                try:
-                    await invalid_log_channel.send(
-                        f"{length} letters | Invalid: `discord.gg/{invite_code}`"
-                    )
-                except Exception as e:
-                    logger.exception("Failed to log invalid %s: %s", invite_code, e)
-
-            elif result == "temporary_error":
-                error_count += 1
-                logger.warning("Temporary error: %s | %s", invite_code, payload)
-
-                try:
-                    await invalid_log_channel.send(
-                        f"{length} letters | Temporary error, skipped: `discord.gg/{invite_code}`"
-                    )
-                except Exception as e:
-                    logger.exception("Failed to log temp error %s: %s", invite_code, e)
-
-                stopped = await sleep_with_stop(BACKOFF_SECONDS)
-                if stopped:
-                    stopped_early = True
-                    break
-
-            else:
-                error_count += 1
-                logger.error("Fatal error: %s | %s", invite_code, payload)
-
-                try:
-                    await invalid_log_channel.send(
-                        f"{length} letters | Error, skipped: `discord.gg/{invite_code}`"
-                    )
-                except Exception as e:
-                    logger.exception("Failed to log fatal error %s: %s", invite_code, e)
-
-            if index == 1 or index % 5 == 0 or index == len(cleaned_codes):
-                try:
-                    await status_msg.edit(
-                        content=(
-                            f"Progress: {index}/{len(cleaned_codes)}\n"
-                            f"Valid: {valid_count} | Invalid: {invalid_count} | Errors: {error_count}\n"
-                            f"Added to invalid files: {added_to_invalid_count} | Removed: {removed_from_invalid_count}\n"
-                            f"Affected lengths: {', '.join(map(str, affected_lengths))}\n"
-                            f"Stop requested: {'Yes' if check_state['stop_requested'] else 'No'}"
-                        )
-                    )
-                except Exception:
-                    pass
-
-            if index < len(cleaned_codes):
-                stopped = await sleep_with_stop(DELAY_SECONDS)
-                if stopped:
-                    stopped_early = True
-                    break
-
-    finally:
-        # Final safety rewrite for all touched lengths
-        for length in affected_lengths:
-            rewrite_invalid_file(length)
-
-        summary_lines = []
-        if stopped_early or check_state["stop_requested"]:
-            summary_lines.append("Check stopped early.")
-        else:
-            summary_lines.append("Done.")
-
-        summary_lines.extend([
-            f"Processed: {check_state['current']}/{len(cleaned_codes)}",
-            f"Valid: {valid_count}",
-            f"Invalid: {invalid_count}",
-            f"Errors: {error_count}",
-            f"Added to invalid files: {added_to_invalid_count}",
-            f"Removed from invalid files: {removed_from_invalid_count}",
-            f"Rewritten lengths: {', '.join(map(str, affected_lengths)) if affected_lengths else 'None'}",
-            f"Files folder: {DATA_DIR}",
-        ])
-
-        try:
-            await status_msg.edit(content="\n".join(summary_lines))
-        except Exception:
-            pass
-
-        await ctx.send("\n".join(summary_lines))
-        reset_check_state()
+    await ctx.send(f"{length}-letter invalid count: `{len(invalid_cache[length])}`")
 
 
 @bot.command()
@@ -639,65 +713,38 @@ async def getinvalid(ctx, length: int):
         await ctx.send("Use a length between 1 and 32.")
         return
 
-    ensure_all_invalid_files()
     load_invalid_cache()
+    rewrite_invalid_file(length)
 
-    ok = rewrite_invalid_file(length)
-    file_path = ensure_invalid_file(length)
-
-    if not ok:
-        await ctx.send("Failed to rewrite that invalid file before sending it.")
-        return
-
-    if not file_path.exists():
-        await ctx.send("That invalid file does not exist.")
-        return
-
-    try:
-        size_bytes = file_path.stat().st_size
-        await ctx.send(
-            content=(
-                f"Here is your invalid vanity file for {length} letters:\n"
-                f"Entries: {len(invalid_cache[length])} | Size: {size_bytes} bytes"
-            ),
-            file=discord.File(str(file_path), filename=file_path.name)
-        )
-    except Exception as e:
-        logger.exception("Failed to send invalid file %s: %s", file_path, e)
-        await ctx.send("Failed to send that file.")
-
-
-@bot.command()
-async def invalidfiles(ctx):
-    ensure_all_invalid_files()
-
-    files = sorted(DATA_DIR.glob("invalid_*_letters.txt"))
-    if not files:
-        await ctx.send(f"No invalid files found, but the folder exists: `{DATA_DIR}`")
-        return
-
-    lines = []
-    for f in files[:30]:
-        try:
-            size_bytes = f.stat().st_size
-        except Exception:
-            size_bytes = -1
-        lines.append(f"{f.name} ({size_bytes} bytes)")
-
-    extra = ""
-    if len(files) > 30:
-        extra = f"\n...and {len(files) - 30} more"
+    path = invalid_file(length)
 
     await ctx.send(
-        f"Invalid txt files are stored in:\n`{DATA_DIR}`\n\nExisting files:\n" + "\n".join(lines) + extra
+        content=f"Invalid file for `{length}` letters:",
+        file=discord.File(str(path), filename=path.name)
     )
 
 
 @bot.command()
-async def remakeinvalidfiles(ctx):
-    ensure_all_invalid_files()
-    rewrite_all_invalid_files()
-    await ctx.send(f"Recreated missing invalid txt files in `{DATA_DIR}`.")
+@commands.has_permissions(administrator=True)
+async def clearinvalid(ctx, length: int = None):
+    load_invalid_cache()
+
+    if length is None:
+        for l in TRACKED_LENGTHS:
+            invalid_cache[l].clear()
+            rewrite_invalid_file(l)
+
+        await ctx.send("Cleared all invalid files.")
+        return
+
+    if length < 1 or length > 32:
+        await ctx.send("Use a length between 1 and 32.")
+        return
+
+    invalid_cache[length].clear()
+    rewrite_invalid_file(length)
+
+    await ctx.send(f"Cleared invalid file for `{length}` letters.")
 
 
 @bot.command()
@@ -707,27 +754,30 @@ async def purge(ctx, amount: int):
         await ctx.send("Use a number above 0.")
         return
 
-    deleted_total = 0
-    remaining = amount
-
-    while remaining > 0:
-        batch_size = min(remaining, 100)
-        deleted = await ctx.channel.purge(limit=batch_size + 1)
-        deleted_total += max(len(deleted) - 1, 0)
-        remaining -= batch_size
-        await asyncio.sleep(2)
-
-    confirm = await ctx.send(f"Deleted {deleted_total} messages.")
+    deleted = await ctx.channel.purge(limit=amount + 1)
+    msg = await ctx.send(f"Deleted `{len(deleted) - 1}` messages.")
     await asyncio.sleep(3)
-    await confirm.delete()
+    await msg.delete()
 
 
-@purge.error
-async def purge_error(ctx, error):
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send("You need Manage Messages permission to use this command.")
-    elif isinstance(error, commands.BadArgument):
-        await ctx.send("Use the command like this: `!purge 500`")
+# =========================
+# EVENTS
+# =========================
+
+@bot.event
+async def on_ready():
+    ensure_dirs()
+    ensure_invalid_files()
+    load_config()
+    load_invalid_cache()
+
+    if not auto_check_loop.is_running():
+        auto_check_loop.start()
+
+    logger.info("Logged in as %s", bot.user)
+    logger.info("Auto enabled: %s", config["auto_enabled"])
+    logger.info("Auto minutes: %s", config["auto_minutes"])
+    logger.info("Saved lists: %s", len(config["lists"]))
 
 
 if not TOKEN:
