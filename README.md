@@ -1,49 +1,52 @@
-# Vanity Bot - Server Layout Version
+# Vanity Checker Bot - Optimized Timing Version
 
-Matches your channel layout:
+## Layout
+- `#valid` = invite exists / already on a server
+- `#invalid` = invite does not exist / not on a server
+- `#summary` = final summary + comma-separated embeds
+- `#log` = progress, cooldowns, errors
 
-- #valid = vanities/invites that are already on a server
-- #invalid = vanities/invites that are not on a server
-- #summary = final comma-separated list embeds
-- #log = progress, errors, and finished logs
+## Timing
+- 3 seconds between every word
+- 10 seconds after every 10 words
+- 60 seconds between saved lists
 
 ## Setup
-
 ```txt
-!setup 4letters #valid #invalid #summary #log love, hate, void, glow
+!setup 3letters #valid #invalid #summary #log abc, lol, pmo, vip
 ```
 
 ## Run
-
 ```txt
-!run 4letters
+!run 3letters
+!runall
 ```
 
 ## Auto
-
 ```txt
 !autocheck 30
 ```
 
-## Batch speed
-
-Default:
-
+## Useful commands
 ```txt
-check 10 invites
-wait 5 seconds
-repeat
+!help
+!lists
+!status 3letters
+!words 3letters new, word, list
+!append 3letters more, words
+!remove_list 3letters
+!stop
+!autostop
+!autostatus
 ```
 
-Railway variables:
-
-```txt
-BATCH_SIZE=10
-BATCH_WAIT_SECONDS=5
-```
-
-## Start Command
-
+## Railway
+Start command:
 ```txt
 python bot.py
+```
+
+Required variable:
+```txt
+DISCORD_TOKEN=your_bot_token
 ```
