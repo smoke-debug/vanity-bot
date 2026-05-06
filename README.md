@@ -1,15 +1,10 @@
-# Vanity Checker Bot - Optimized Timing Version
+# Vanity Checker Bot - Final Slow/Safe Version
 
-## Layout
+## Channels
 - `#valid` = invite exists / already on a server
 - `#invalid` = invite does not exist / not on a server
-- `#summary` = final summary + comma-separated embeds
-- `#log` = progress, cooldowns, errors
-
-## Timing
-- 3 seconds between every word
-- 10 seconds after every 10 words
-- 60 seconds between saved lists
+- `#summary` = complete summary embeds and full txt files
+- `#log` = progress, cooldowns, and errors
 
 ## Setup
 ```txt
@@ -22,31 +17,30 @@
 !runall
 ```
 
+## Add more words without replacing
+```txt
+!append 3letters new, more, words
+```
+
+## Replace list
+```txt
+!words 3letters new, full, replacement, list
+```
+
+## Get latest txt files
+```txt
+!gettxt valid 3
+!gettxt invalid 3
+!gettxt valid
+!gettxt invalid
+!gettxt all
+```
+
 ## Auto
 ```txt
 !autocheck 30
-```
-
-## Useful commands
-```txt
-!help
-!lists
-!status 3letters
-!words 3letters new, word, list
-!append 3letters more, words
-!remove_list 3letters
-!stop
 !autostop
 !autostatus
 ```
 
-## Railway
-Start command:
-```txt
-python bot.py
-```
-
-Required variable:
-```txt
-DISCORD_TOKEN=your_bot_token
-```
+Railway start command: `python bot.py`
