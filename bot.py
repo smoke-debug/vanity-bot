@@ -1,369 +1,1054 @@
-import os, json, asyncio, logging
+import os
+import re
+import json
+import asyncio
+import logging
 from pathlib import Path
+from collections import defaultdict
 from datetime import datetime, timezone
+from typing import Optional, Tuple, Any
+
+import aiohttp
 import discord
 from discord.ext import commands, tasks
 
-TOKEN=os.getenv('DISCORD_TOKEN')
-PREFIX=os.getenv('BOT_PREFIX','!')
-WORD_DELAY_SECONDS=float(os.getenv('WORD_DELAY_SECONDS','5'))
-BATCH_SIZE=int(os.getenv('BATCH_SIZE','10'))
-BATCH_COOLDOWN_SECONDS=float(os.getenv('BATCH_COOLDOWN_SECONDS','20'))
-LIST_COOLDOWN_SECONDS=float(os.getenv('LIST_COOLDOWN_SECONDS','90'))
-MAX_RETRIES=int(os.getenv('MAX_RETRIES','3'))
-BACKOFF_SECONDS=float(os.getenv('BACKOFF_SECONDS','45'))
-MAX_CODES_PER_LIST=int(os.getenv('MAX_CODES_PER_LIST','5000'))
-MIN_AUTO_MINUTES=int(os.getenv('MIN_AUTO_MINUTES','10'))
+# =========================
+# BASIC SETTINGS
+# =========================
+TOKEN = os.getenv("DISCORD_TOKEN")
+DEFAULT_PREFIX = os.getenv("BOT_PREFIX", "!")
 
-BASE_DIR=Path(__file__).resolve().parent
-DATA_DIR=BASE_DIR/'data'
-TXT_DIR=DATA_DIR/'txt_files'
-CONFIG_FILE=DATA_DIR/'vanity_config.json'
+# Safer defaults for Discord / Cloudflare. You can change these with commands too.
+DEFAULT_DELAY_SECONDS = 8
+DEFAULT_BATCH_SIZE = 5
+DEFAULT_BATCH_COOLDOWN_SECONDS = 60
+DEFAULT_LIST_COOLDOWN_SECONDS = 90
+DEFAULT_AUTO_MINUTES = 60
+MAX_RETRIES = 3
+MAX_CODES_PER_LIST = 1500
+BLOCK_COOLDOWN_SECONDS = 600
 
-logging.basicConfig(level=logging.INFO,format='%(asctime)s | %(levelname)s | %(name)s | %(message)s')
-log=logging.getLogger('vanity_checker')
+API_BASE = "https://discord.com/api/v10/invites"
 
-intents=discord.Intents.default(); intents.message_content=True; intents.guilds=True
-bot=commands.Bot(command_prefix=PREFIX,intents=intents,help_command=None)
-check_lock=asyncio.Lock()
-check_state={'running':False,'stop_requested':False,'current':0,'total':0,'list':None}
-config={'auto_enabled':False,'auto_minutes':60,'lists':{}}
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+UNAVAILABLE_DIR = DATA_DIR / "unavailable_vanities"
+CONFIG_FILE = DATA_DIR / "vanity_config.json"
+TRACKED_LENGTHS = range(1, 33)
 
-def ensure_dirs():
-    DATA_DIR.mkdir(parents=True,exist_ok=True); TXT_DIR.mkdir(parents=True,exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+logger = logging.getLogger("vanity_checker")
 
-def save_config():
-    ensure_dirs(); CONFIG_FILE.write_text(json.dumps(config,indent=4),encoding='utf-8')
+intents = discord.Intents.default()
+intents.guilds = True
+intents.message_content = True
 
-def load_config():
-    global config
-    ensure_dirs()
-    if not CONFIG_FILE.exists(): save_config(); return
+# config gets loaded before the bot goes ready. The dynamic prefix uses this.
+config = {
+    "prefix": DEFAULT_PREFIX,
+    "auto_enabled": False,
+    "auto_minutes": DEFAULT_AUTO_MINUTES,
+    "delay_seconds": DEFAULT_DELAY_SECONDS,
+    "batch_size": DEFAULT_BATCH_SIZE,
+    "batch_cooldown_seconds": DEFAULT_BATCH_COOLDOWN_SECONDS,
+    "list_cooldown_seconds": DEFAULT_LIST_COOLDOWN_SECONDS,
+    "lists": {}
+}
+
+
+def get_prefix(bot_obj, message):
+    return config.get("prefix", DEFAULT_PREFIX)
+
+
+bot = commands.Bot(command_prefix=get_prefix, intents=intents, help_command=None)
+
+unavailable_cache = defaultdict(set)
+
+check_state = {
+    "running": False,
+    "stop_requested": False,
+    "current": 0,
+    "total": 0,
+    "mode": None,
+}
+
+# =========================
+# FILE / CONFIG HELPERS
+# =========================
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def format_time(iso_time: Optional[str]) -> str:
+    if not iso_time:
+        return "Unknown"
     try:
-        loaded=json.loads(CONFIG_FILE.read_text(encoding='utf-8'))
-        config['auto_enabled']=loaded.get('auto_enabled',False)
-        config['auto_minutes']=loaded.get('auto_minutes',60)
-        config['lists']=loaded.get('lists',{})
+        dt = datetime.fromisoformat(iso_time)
+        unix = int(dt.timestamp())
+        return f"<t:{unix}:F> • <t:{unix}:R>"
     except Exception:
-        log.exception('Broken config, resetting')
-        try: CONFIG_FILE.rename(DATA_DIR/f'vanity_config_broken_{int(datetime.now().timestamp())}.json')
-        except Exception: pass
-        config={'auto_enabled':False,'auto_minutes':60,'lists':{}}
+        return "Unknown"
+
+
+def ensure_dirs() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    UNAVAILABLE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def save_config() -> None:
+    ensure_dirs()
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=4)
+
+
+def load_config() -> None:
+    ensure_dirs()
+    if not CONFIG_FILE.exists():
         save_config()
+        return
 
-def now_iso(): return datetime.now(timezone.utc).isoformat()
-def utc_now(): return datetime.now(timezone.utc)
-
-def format_time(iso):
-    if not iso: return 'Unknown'
     try:
-        ts=int(datetime.fromisoformat(iso).timestamp())
-        return f'<t:{ts}:F> • <t:{ts}:R>'
-    except Exception: return 'Unknown'
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+    except Exception as e:
+        logger.warning("Config failed to load, using defaults: %s", e)
+        save_config()
+        return
 
-def format_duration(seconds):
-    seconds=int(seconds); h=seconds//3600; m=(seconds%3600)//60; s=seconds%60
-    return f'{h}h {m}m {s}s' if h else (f'{m}m {s}s' if m else f'{s}s')
+    config["prefix"] = str(loaded.get("prefix", DEFAULT_PREFIX))[:5] or DEFAULT_PREFIX
+    config["auto_enabled"] = bool(loaded.get("auto_enabled", False))
+    config["auto_minutes"] = int(loaded.get("auto_minutes", DEFAULT_AUTO_MINUTES))
+    config["delay_seconds"] = int(loaded.get("delay_seconds", DEFAULT_DELAY_SECONDS))
+    config["batch_size"] = int(loaded.get("batch_size", DEFAULT_BATCH_SIZE))
+    config["batch_cooldown_seconds"] = int(loaded.get("batch_cooldown_seconds", DEFAULT_BATCH_COOLDOWN_SECONDS))
+    config["list_cooldown_seconds"] = int(loaded.get("list_cooldown_seconds", DEFAULT_LIST_COOLDOWN_SECONDS))
+    config["lists"] = loaded.get("lists", {}) if isinstance(loaded.get("lists", {}), dict) else {}
 
-def clean_code(x):
-    s=str(x)
-    for p in ['https://discord.gg/','http://discord.gg/','discord.gg/','https://discord.com/invite/','http://discord.com/invite/','discord.com/invite/']:
-        s=s.replace(p,'')
-    return s.strip().strip('/').lower()
 
-def parse_words(words):
-    seen=set(); out=[]
-    for item in words.replace('\n',',').split(','):
-        c=clean_code(item)
-        if c and c not in seen:
-            seen.add(c); out.append(c)
-    return out
+def unavailable_file(length: int) -> Path:
+    return UNAVAILABLE_DIR / f"unavailable_{length}_letters.txt"
 
-def list_ready(data):
-    for k in ['valid_channel_id','invalid_channel_id','summary_channel_id','log_channel_id','words']:
-        if k not in data or data[k] in (None,'',[]): return False,f'Missing `{k}`'
-    return True,'Ready'
 
-async def get_channel_safe(cid):
-    if not cid: return None
-    try: cid=int(cid)
-    except Exception: return None
-    return bot.get_channel(cid) or await bot.fetch_channel(cid)
+def ensure_unavailable_files() -> None:
+    ensure_dirs()
+    for length in TRACKED_LENGTHS:
+        unavailable_file(length).touch(exist_ok=True)
 
-async def safe_send(ch,content=None,embed=None,file=None):
-    if not ch: return None
-    for _ in range(2):
-        try: return await ch.send(content=content,embed=embed,file=file)
-        except discord.HTTPException as e:
-            log.warning('send http error: %s',e); await asyncio.sleep(5)
-        except Exception as e:
-            log.warning('send failed: %s',e); return None
-    return None
 
-async def sleep_with_stop(sec):
-    waited=0.0
-    while waited<sec:
-        if check_state['stop_requested']: return True
-        step=min(.5,sec-waited); await asyncio.sleep(step); waited+=step
+def clean_code(item: Any) -> str:
+    text = str(item).strip()
+    text = re.sub(r"https?://", "", text, flags=re.I)
+    text = text.replace("discord.gg/", "")
+    text = text.replace("discord.com/invite/", "")
+    text = text.strip().strip("/").strip()
+    text = text.split("?")[0].split("#")[0]
+    text = text.lower()
+    # Discord invite codes are usually letters/numbers/underscore/hyphen.
+    text = re.sub(r"[^a-z0-9_-]", "", text)
+    return text
+
+
+def parse_words(words: str) -> list[str]:
+    # Supports comma-separated, space-separated, or newline-separated words.
+    raw_items = re.split(r"[,\n\s]+", words)
+    seen = set()
+    cleaned = []
+    for item in raw_items:
+        code = clean_code(item)
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        cleaned.append(code)
+    return cleaned
+
+
+def load_unavailable_cache() -> None:
+    unavailable_cache.clear()
+    ensure_unavailable_files()
+    for length in TRACKED_LENGTHS:
+        path = unavailable_file(length)
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                code = clean_code(line)
+                if code and len(code) == length:
+                    unavailable_cache[length].add(code)
+
+
+def rewrite_unavailable_file(length: int) -> None:
+    path = unavailable_file(length)
+    with open(path, "w", encoding="utf-8") as f:
+        for code in sorted(unavailable_cache[length]):
+            f.write(code + "\n")
+
+
+def add_unavailable(code: str) -> bool:
+    code = clean_code(code)
+    length = len(code)
+    if length not in TRACKED_LENGTHS:
+        return False
+    before = len(unavailable_cache[length])
+    unavailable_cache[length].add(code)
+    if len(unavailable_cache[length]) != before:
+        rewrite_unavailable_file(length)
+        return True
     return False
 
-def chunks(words,limit=3900):
-    res=[]; cur=''
-    for w in words:
-        add=w if not cur else ', '+w
-        if len(cur)+len(add)>limit:
-            if cur: res.append(cur)
-            cur=w
-        else: cur+=add
-    if cur: res.append(cur)
-    return res
 
-async def fetch_invite_status(code):
-    for attempt in range(1,MAX_RETRIES+1):
-        if check_state['stop_requested']: return 'stopped',None
-        try:
-            inv=await bot.fetch_invite(code)
-            return 'valid',inv
-        except discord.NotFound: return 'invalid',None
-        except discord.Forbidden as e: return 'error',f'Forbidden: {e}'
-        except discord.HTTPException as e:
-            log.warning('HTTP error %s attempt %s/%s: %s',code,attempt,MAX_RETRIES,e)
-            if attempt<MAX_RETRIES:
-                if await sleep_with_stop(BACKOFF_SECONDS*attempt): return 'stopped',None
-                continue
-            return 'error',f'HTTPException: {e}'
-        except Exception as e:
-            log.exception('unexpected error checking %s',code)
-            if attempt<MAX_RETRIES:
-                if await sleep_with_stop(BACKOFF_SECONDS*attempt): return 'stopped',None
-                continue
-            return 'error',f'{type(e).__name__}: {e}'
-    return 'error','Unknown error'
+def remove_unavailable(code: str) -> bool:
+    code = clean_code(code)
+    length = len(code)
+    if length not in TRACKED_LENGTHS:
+        return False
+    if code in unavailable_cache[length]:
+        unavailable_cache[length].remove(code)
+        rewrite_unavailable_file(length)
+        return True
+    return False
 
-def write_category_files(valid_words,invalid_words):
-    ensure_dirs()
-    (TXT_DIR/'valid_all.txt').write_text(', '.join(valid_words),encoding='utf-8')
-    (TXT_DIR/'invalid_all.txt').write_text(', '.join(invalid_words),encoding='utf-8')
-    for length in sorted({len(w) for w in valid_words}):
-        ws=[w for w in valid_words if len(w)==length]
-        (TXT_DIR/f'valid_{length}_letters.txt').write_text(', '.join(ws),encoding='utf-8')
-    for length in sorted({len(w) for w in invalid_words}):
-        ws=[w for w in invalid_words if len(w)==length]
-        (TXT_DIR/f'invalid_{length}_letters.txt').write_text(', '.join(ws),encoding='utf-8')
+# =========================
+# DISCORD HELPERS
+# =========================
 
-async def send_words_output(ch,title,words,color,filename):
-    if not words:
-        await safe_send(ch,f'No {title.lower()} found.'); return
-    for i,chunk in enumerate(chunks(words),1):
-        e=discord.Embed(title=f'{title}{f" Part {i}" if len(chunks(words))>1 else ""}',description=f'```txt\n{chunk}\n```',color=color)
-        await safe_send(ch,embed=e); await asyncio.sleep(1)
-    path=TXT_DIR/filename; path.write_text(', '.join(words),encoding='utf-8')
-    await safe_send(ch,content=f'Full `{title}` txt file:',file=discord.File(str(path),filename=path.name))
-
-async def run_list_unlocked(name,data,ctx=None):
-    ready,reason=list_ready(data)
-    if not ready:
-        if ctx: await ctx.send(f'`{name}` is not ready. {reason}. Use `{PREFIX}status {name}`.')
-        return
+async def get_channel(channel_id: Any):
     try:
-        valid_ch=await get_channel_safe(data['valid_channel_id']); invalid_ch=await get_channel_safe(data['invalid_channel_id'])
-        summary_ch=await get_channel_safe(data['summary_channel_id']); log_ch=await get_channel_safe(data['log_channel_id'])
+        channel_id = int(channel_id)
     except Exception:
-        if ctx: await ctx.send(f'`{name}` has a channel I cannot access. Check bot permissions.')
-        return
-    if not all([valid_ch,invalid_ch,summary_ch,log_ch]):
-        if ctx: await ctx.send(f'`{name}` has a channel I cannot access. Check bot permissions.')
-        return
-    codes=[]; seen=set()
-    for w in data.get('words',[]):
-        c=clean_code(w)
-        if c and c not in seen: seen.add(c); codes.append(c)
-    if not codes: await safe_send(log_ch,f'`{name}` has no usable words.'); return
-    codes=codes[:MAX_CODES_PER_LIST]
-    check_state.update({'running':True,'stop_requested':False,'current':0,'total':len(codes),'list':name})
-    valid_words=[]; invalid_words=[]; error_words=[]; start=utc_now(); started=start.isoformat()
-    await safe_send(log_ch,f'🔍 Started `{name}` with `{len(codes)}` invite(s). Speed: `{WORD_DELAY_SECONDS}s` between words, `{BATCH_COOLDOWN_SECONDS}s` every `{BATCH_SIZE}` words.')
+        return None
+
+    channel = bot.get_channel(channel_id)
+    if channel:
+        return channel
     try:
-        for i,code in enumerate(codes,1):
-            if check_state['stop_requested']: break
-            check_state['current']=i
-            result,payload=await fetch_invite_status(code)
-            if result=='stopped': break
-            if result=='valid':
-                valid_words.append(code); await safe_send(valid_ch,f'discord.gg/{code}')
-            elif result=='invalid':
-                invalid_words.append(code); await safe_send(invalid_ch,f'discord.gg/{code}')
-            else:
-                error_words.append(code); await safe_send(log_ch,f'⚠️ Error checking `{code}`: `{payload}`')
-            if i<len(codes) and i%BATCH_SIZE!=0:
-                if await sleep_with_stop(WORD_DELAY_SECONDS): break
-            if i%BATCH_SIZE==0 and i<len(codes):
-                await safe_send(log_ch,f'Progress `{i}/{len(codes)}` | Valid: `{len(valid_words)}` | Invalid: `{len(invalid_words)}` | Errors: `{len(error_words)}`\nBatch cooldown: `{BATCH_COOLDOWN_SECONDS}s`...')
-                if await sleep_with_stop(BATCH_COOLDOWN_SECONDS): break
+        return await bot.fetch_channel(channel_id)
+    except Exception:
+        return None
+
+
+async def safe_send(channel, content=None, embed=None, file=None):
+    if not channel:
+        return None
+    try:
+        return await channel.send(content=content, embed=embed, file=file)
     except Exception as e:
-        log.exception('list failure')
-        await safe_send(log_ch,f'⚠️ `{name}` had an unexpected error but stayed online: `{type(e).__name__}: {e}`')
+        logger.warning("Send failed: %s", e)
+        return None
+
+
+async def sleep_with_stop(seconds: int | float) -> bool:
+    waited = 0.0
+    while waited < float(seconds):
+        if check_state["stop_requested"]:
+            return True
+        await asyncio.sleep(0.5)
+        waited += 0.5
+    return False
+
+
+def find_role(ctx, role_input: str):
+    if not role_input:
+        return None
+
+    role_input = role_input.strip()
+    if role_input.lower() in {"none", "no", "null", "0"}:
+        return None
+
+    if role_input.startswith("<@&") and role_input.endswith(">"):
+        role_id = role_input.replace("<@&", "").replace(">", "")
+        if role_id.isdigit():
+            return ctx.guild.get_role(int(role_id))
+
+    if role_input.isdigit():
+        return ctx.guild.get_role(int(role_input))
+
+    lowered = role_input.lower()
+    for role in ctx.guild.roles:
+        if role.name.lower() == lowered:
+            return role
+    return None
+
+
+def short_text(text: Any, limit: int = 180) -> str:
+    text = str(text).replace("`", "'").replace("\n", " ").strip()
+    return text[:limit] + ("..." if len(text) > limit else "")
+
+# =========================
+# INVITE CHECKING
+# =========================
+
+async def fetch_invite_status(session: aiohttp.ClientSession, code: str) -> Tuple[str, Optional[Any]]:
+    """
+    Returns:
+      available  = Discord says Unknown Invite / 404. This is the one hunters usually want.
+      taken      = Invite exists / 200.
+      rate_limited = Retry failed too many times.
+      blocked    = Cloudflare / HTML / non-JSON response. The checker should stop or cool down.
+      error      = Other HTTP/network issue.
+      stopped    = User requested stop.
+    """
+    code = clean_code(code)
+    if not code:
+        return "error", "Empty code"
+
+    url = f"{API_BASE}/{code}?with_counts=true&with_expiration=true"
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 DiscordBot VanityChecker/2.0"
+    }
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        if check_state["stop_requested"]:
+            return "stopped", None
+
+        try:
+            async with session.get(url, headers=headers) as resp:
+                status = resp.status
+                content_type = resp.headers.get("content-type", "").lower()
+                text = await resp.text()
+
+                # Cloudflare/challenge pages are HTML, not JSON. Do not keep hammering it.
+                if "application/json" not in content_type:
+                    lowered = text.lower()
+                    if "cloudflare" in lowered or "cf-challenge" in lowered or "challenge-platform" in lowered or "<html" in lowered:
+                        return "blocked", f"Cloudflare/non-JSON response. HTTP {status}. Cool down before checking again."
+                    return "error", f"Non-JSON response. HTTP {status}. Content-Type: {content_type or 'unknown'}"
+
+                try:
+                    data = json.loads(text) if text else {}
+                except json.JSONDecodeError:
+                    return "error", f"JSON decode failed. HTTP {status}."
+
+                if status == 200:
+                    return "taken", data
+
+                if status == 404:
+                    # Discord code 10006 = Unknown Invite.
+                    return "available", data
+
+                if status == 429:
+                    retry_after = data.get("retry_after") or resp.headers.get("Retry-After") or 10
+                    try:
+                        retry_after = float(retry_after)
+                    except Exception:
+                        retry_after = 10.0
+
+                    if attempt < MAX_RETRIES:
+                        logger.warning("Rate limited on %s. Waiting %.2fs", code, retry_after)
+                        stopped = await sleep_with_stop(retry_after + 1)
+                        if stopped:
+                            return "stopped", None
+                        continue
+                    return "rate_limited", f"Still rate limited after {MAX_RETRIES} retries."
+
+                if status in {500, 502, 503, 504} and attempt < MAX_RETRIES:
+                    wait_time = 15 * attempt
+                    stopped = await sleep_with_stop(wait_time)
+                    if stopped:
+                        return "stopped", None
+                    continue
+
+                return "error", f"HTTP {status}: {short_text(data)}"
+
+        except aiohttp.ClientError as e:
+            if attempt < MAX_RETRIES:
+                stopped = await sleep_with_stop(10 * attempt)
+                if stopped:
+                    return "stopped", None
+                continue
+            return "error", f"Network error: {short_text(e)}"
+        except asyncio.TimeoutError:
+            if attempt < MAX_RETRIES:
+                stopped = await sleep_with_stop(10 * attempt)
+                if stopped:
+                    return "stopped", None
+                continue
+            return "error", "Request timed out"
+        except Exception as e:
+            return "error", f"Unexpected error: {short_text(e)}"
+
+    return "error", "Unknown error"
+
+# =========================
+# EMBEDS / OUTPUT
+# =========================
+
+def build_summary_embed(list_name, processed, available, taken, errors, blocked, added, removed, stopped, updated_at):
+    if blocked:
+        title = f"Check Paused: {list_name}"
+        color = discord.Color.red()
+    elif stopped:
+        title = f"Check Stopped: {list_name}"
+        color = discord.Color.orange()
+    else:
+        title = f"Check Finished: {list_name}"
+        color = discord.Color.green()
+
+    embed = discord.Embed(title=title, color=color)
+    embed.add_field(name="Processed", value=str(processed), inline=True)
+    embed.add_field(name="Available", value=str(available), inline=True)
+    embed.add_field(name="Taken/Unavailable", value=str(taken), inline=True)
+    embed.add_field(name="Errors", value=str(errors), inline=True)
+    embed.add_field(name="Cloudflare Blocks", value=str(blocked), inline=True)
+    embed.add_field(name="Added To Unavailable Files", value=str(added), inline=True)
+    embed.add_field(name="Removed From Unavailable Files", value=str(removed), inline=True)
+    embed.add_field(name="List Last Updated", value=format_time(updated_at), inline=False)
+    embed.set_footer(text="Vanity checker • available means Discord returned Unknown Invite")
+    return embed
+
+
+async def send_available_words(channel, list_name: str, available_found: list[str]):
+    if not available_found:
+        await safe_send(channel, f"No available words found for `{list_name}`.")
+        return
+
+    paragraph = ", ".join(available_found)
+    if len(paragraph) <= 1900:
+        await safe_send(channel, f"Available words for `{list_name}`:\n```txt\n{paragraph}\n```")
+        return
+
+    file_path = DATA_DIR / f"{list_name}_available_words.txt"
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(paragraph)
+
+    await safe_send(
+        channel,
+        content=f"Available words for `{list_name}` were too long for one message, so here is the txt file:",
+        file=discord.File(str(file_path), filename=file_path.name)
+    )
+
+# =========================
+# CHECK RUNNERS
+# =========================
+
+async def run_list_check(list_name: str, list_data: dict, manual_ctx=None):
+    claim_channel = await get_channel(list_data.get("claim_channel_id"))
+    log_channel = await get_channel(list_data.get("log_channel_id"))
+    summary_channel = await get_channel(list_data.get("summary_channel_id"))
+    ping_role_id = list_data.get("ping_role_id")
+    words = list_data.get("words", [])
+
+    if not claim_channel or not log_channel or not summary_channel:
+        if manual_ctx:
+            await manual_ctx.send(f"`{list_name}` has a missing or broken channel setup. Run `{config['prefix']}listinfo {list_name}` and fix the channels.")
+        return
+
+    cleaned_codes = []
+    seen = set()
+    for word in words:
+        code = clean_code(word)
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        cleaned_codes.append(code)
+
+    if not cleaned_codes:
+        await safe_send(summary_channel, f"`{list_name}` has no usable words.")
+        return
+
+    cleaned_codes = cleaned_codes[:MAX_CODES_PER_LIST]
+
+    check_state["running"] = True
+    check_state["stop_requested"] = False
+    check_state["current"] = 0
+    check_state["total"] = len(cleaned_codes)
+    check_state["mode"] = list_name
+
+    available_count = 0
+    taken_count = 0
+    error_count = 0
+    blocked_count = 0
+    added_count = 0
+    removed_count = 0
+    available_found = []
+
+    status_msg = await safe_send(summary_channel, f"Checking `{list_name}` — `{len(cleaned_codes)}` word(s)...")
+
+    timeout = aiohttp.ClientTimeout(total=30)
+    batch_size = max(1, int(config.get("batch_size", DEFAULT_BATCH_SIZE)))
+    delay_seconds = max(3, int(config.get("delay_seconds", DEFAULT_DELAY_SECONDS)))
+    batch_cooldown = max(10, int(config.get("batch_cooldown_seconds", DEFAULT_BATCH_COOLDOWN_SECONDS)))
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for index, code in enumerate(cleaned_codes, start=1):
+                check_state["current"] = index
+
+                if check_state["stop_requested"]:
+                    break
+
+                result, payload = await fetch_invite_status(session, code)
+                length = len(code)
+
+                if result == "stopped":
+                    break
+
+                if result == "available":
+                    available_count += 1
+                    available_found.append(code)
+
+                    if remove_unavailable(code):
+                        removed_count += 1
+                        await safe_send(log_channel, f"`discord.gg/{code}` is now available and was removed from unavailable files.")
+
+                    await safe_send(claim_channel, f"discord.gg/{code}")
+
+                elif result == "taken":
+                    taken_count += 1
+                    if add_unavailable(code):
+                        added_count += 1
+                        await safe_send(log_channel, f"{length} letters | Taken/unavailable: `discord.gg/{code}`")
+
+                elif result == "blocked":
+                    blocked_count += 1
+                    await safe_send(log_channel, f"Cloudflare block while checking `discord.gg/{code}`: `{short_text(payload, 350)}`")
+                    await safe_send(summary_channel, f"Cloudflare blocked the checker. Pausing `{list_name}` for safety. Wait at least `{BLOCK_COOLDOWN_SECONDS // 60}` minutes before trying again.")
+                    check_state["stop_requested"] = True
+                    break
+
+                elif result == "rate_limited":
+                    error_count += 1
+                    await safe_send(log_channel, f"Rate limited checking `discord.gg/{code}`: `{short_text(payload, 350)}`")
+
+                else:
+                    error_count += 1
+                    await safe_send(log_channel, f"Error checking `discord.gg/{code}`: `{short_text(payload, 350)}`")
+
+                if status_msg and (index == 1 or index % 10 == 0 or index == len(cleaned_codes)):
+                    try:
+                        await status_msg.edit(
+                            content=(
+                                f"Checking `{list_name}`...\n"
+                                f"Progress: `{index}/{len(cleaned_codes)}`\n"
+                                f"Available: `{available_count}` | Taken: `{taken_count}` | Errors: `{error_count}` | Blocks: `{blocked_count}`"
+                            )
+                        )
+                    except Exception:
+                        pass
+
+                if index < len(cleaned_codes):
+                    if index % batch_size == 0:
+                        stopped = await sleep_with_stop(batch_cooldown)
+                    else:
+                        stopped = await sleep_with_stop(delay_seconds)
+                    if stopped:
+                        break
+
     finally:
-        end=utc_now(); elapsed=format_duration((end-start).total_seconds()); stopped=check_state['stop_requested']
-        write_category_files(valid_words,invalid_words)
-        e=discord.Embed(title=f'{"Stopped" if stopped else "Done"} Checking: {name}',description=f'Check completed in **{elapsed}**.',color=discord.Color.orange() if stopped else discord.Color.green())
-        e.add_field(name='Processed',value=f'{check_state["current"]}/{len(codes)}',inline=True); e.add_field(name='Valid / On Server',value=str(len(valid_words)),inline=True); e.add_field(name='Invalid / Not On Server',value=str(len(invalid_words)),inline=True); e.add_field(name='Errors',value=str(len(error_words)),inline=True)
-        e.add_field(name='Started',value=format_time(started),inline=False); e.add_field(name='Finished',value=format_time(end.isoformat()),inline=False); e.add_field(name='List Last Updated',value=format_time(data.get('updated_at')),inline=False); e.set_footer(text='Valid = on a server • Invalid = not on a server')
-        await safe_send(summary_ch,embed=e)
-        await send_words_output(summary_ch,'Valid / On Server Words',valid_words,discord.Color.blurple(),f'{name}_valid_on_server.txt')
-        await send_words_output(summary_ch,'Invalid / Not On Server Words',invalid_words,discord.Color.dark_gray(),f'{name}_invalid_not_on_server.txt')
-        if error_words: await send_words_output(summary_ch,'Error Words',error_words,discord.Color.red(),f'{name}_errors.txt')
-        await safe_send(log_ch,f'✅ `{name}` check is done. Time taken: `{elapsed}` | Processed: `{check_state["current"]}/{len(codes)}` | Valid: `{len(valid_words)}` | Invalid: `{len(invalid_words)}` | Errors: `{len(error_words)}`')
-        check_state.update({'running':False,'stop_requested':False,'current':0,'total':0,'list':None})
+        stopped = check_state["stop_requested"]
+        await send_available_words(claim_channel, list_name, available_found)
 
-async def run_one(name,ctx=None):
-    if check_lock.locked():
-        if ctx: await ctx.send('List is already running, please wait.')
-        return
-    name=name.lower()
-    if name not in config['lists']:
-        if ctx: await ctx.send(f'No list named `{name}` exists.')
-        return
-    async with check_lock: await run_list_unlocked(name,config['lists'][name],ctx)
+        embed = build_summary_embed(
+            list_name=list_name,
+            processed=check_state["current"],
+            available=available_count,
+            taken=taken_count,
+            errors=error_count,
+            blocked=blocked_count,
+            added=added_count,
+            removed=removed_count,
+            stopped=stopped,
+            updated_at=list_data.get("updated_at")
+        )
 
-async def run_all(ctx=None):
-    if check_lock.locked():
-        if ctx: await ctx.send('List is already running, please wait.')
+        ping_text = f"<@&{ping_role_id}> " if ping_role_id else ""
+        await safe_send(summary_channel, content=ping_text, embed=embed)
+
+        check_state["running"] = False
+        check_state["stop_requested"] = False
+        check_state["current"] = 0
+        check_state["total"] = 0
+        check_state["mode"] = None
+
+
+async def run_all_checks(manual_ctx=None):
+    if check_state["running"]:
+        if manual_ctx:
+            await manual_ctx.send(
+                f"A check is already running: `{check_state['mode']}` "
+                f"`{check_state['current']}/{check_state['total']}`"
+            )
         return
-    async with check_lock:
-        if not config['lists']:
-            if ctx: await ctx.send('No saved lists found.')
-            return
-        items=list(config['lists'].items())
-        for idx,(name,data) in enumerate(items,1):
-            if check_state['stop_requested']: break
-            await run_list_unlocked(name,data,ctx)
-            if idx<len(items):
-                try: log_ch=await get_channel_safe(data.get('log_channel_id'))
-                except Exception: log_ch=None
-                await safe_send(log_ch,f'⏳ Waiting `{format_duration(LIST_COOLDOWN_SECONDS)}` before checking `{items[idx][0]}`...')
-                if await sleep_with_stop(LIST_COOLDOWN_SECONDS): break
+
+    load_unavailable_cache()
+
+    if not config["lists"]:
+        if manual_ctx:
+            await manual_ctx.send("No saved lists found.")
+        return
+
+    list_cooldown = max(10, int(config.get("list_cooldown_seconds", DEFAULT_LIST_COOLDOWN_SECONDS)))
+    items = list(config["lists"].items())
+
+    for idx, (list_name, list_data) in enumerate(items, start=1):
+        await run_list_check(list_name, list_data, manual_ctx=manual_ctx)
+        if check_state["stop_requested"]:
+            break
+        if idx < len(items):
+            await sleep_with_stop(list_cooldown)
+
+# =========================
+# AUTO LOOP
+# =========================
 
 @tasks.loop(minutes=1)
-async def auto_loop():
-    if not config.get('auto_enabled',False): return
-    if not hasattr(auto_loop,'counter'): auto_loop.counter=0
-    auto_loop.counter+=1
-    if auto_loop.counter<int(config.get('auto_minutes',60)): return
-    auto_loop.counter=0
-    if not check_lock.locked(): await run_all()
+async def auto_check_loop():
+    if not config.get("auto_enabled", False):
+        return
 
-@bot.command(name='help')
-async def help_cmd(ctx):
-    e=discord.Embed(title='Vanity Bot Help',description=f'`#valid` = on server\n`#invalid` = not on server\n`#summary` = complete embeds + txt files\n`#log` = progress/errors\n\nSpeed: `{WORD_DELAY_SECONDS}s` per word, `{BATCH_COOLDOWN_SECONDS}s` every `{BATCH_SIZE}`, `{format_duration(LIST_COOLDOWN_SECONDS)}` between lists.',color=discord.Color.blurple())
-    e.add_field(name='Setup',value=f'`{PREFIX}setup <list> #valid #invalid #summary #log <words>`\n`{PREFIX}setup 3letters #valid #invalid #summary #log abc, lol, pmo`',inline=False)
-    e.add_field(name='Run',value=f'`{PREFIX}run <list>`\n`{PREFIX}runall`\n`{PREFIX}stop`',inline=False)
-    e.add_field(name='Manage Words',value=f'`{PREFIX}words <list> <words>` = replace\n`{PREFIX}append <list> <words>` = add more\n`{PREFIX}remove_words <list> <words>` = remove',inline=False)
-    e.add_field(name='Lists',value=f'`{PREFIX}lists`\n`{PREFIX}status <list>`\n`{PREFIX}remove_list <list>`',inline=False)
-    e.add_field(name='Auto',value=f'`{PREFIX}autocheck <minutes>`\n`{PREFIX}autostop`\n`{PREFIX}autostatus`',inline=False)
-    e.add_field(name='Txt Files',value=f'`{PREFIX}gettxt valid <length>`\n`{PREFIX}gettxt invalid <length>`\n`{PREFIX}gettxt valid`\n`{PREFIX}gettxt invalid`\n`{PREFIX}gettxt all`',inline=False)
-    await ctx.send(embed=e)
+    minutes = max(5, int(config.get("auto_minutes", DEFAULT_AUTO_MINUTES)))
+
+    if not hasattr(auto_check_loop, "counter"):
+        auto_check_loop.counter = 0
+
+    auto_check_loop.counter += 1
+    if auto_check_loop.counter < minutes:
+        return
+
+    auto_check_loop.counter = 0
+    if not check_state["running"]:
+        await run_all_checks()
+
+# =========================
+# COMMANDS
+# =========================
+
+@bot.command(name="help")
+async def help_command(ctx):
+    p = config.get("prefix", DEFAULT_PREFIX)
+    embed = discord.Embed(
+        title="Vanity Checker Help",
+        description="Checks invite codes safely using Discord's API, handles rate limits, and stops on Cloudflare HTML blocks instead of crashing.",
+        color=discord.Color.blurple()
+    )
+    embed.add_field(
+        name="Setup",
+        value=(
+            f"`{p}addlist <name> <claim_channel> <log_channel> <summary_channel> <ping_role|none> <words>`\n"
+            f"Example:\n`{p}addlist 4letters #claims #vanity-logs #summaries @Hunters love, hate, void, glow`"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="Manage Lists",
+        value=(
+            f"`{p}lists`\n`{p}listinfo <name>`\n`{p}addwords <name> <words>`\n"
+            f"`{p}removewords <name> <words>`\n`{p}setchannels <name> <claim> <log> <summary>`\n"
+            f"`{p}setpingrole <name> <role|none>`\n`{p}removelist <name>`\n`{p}clearlists`"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="Checks",
+        value=f"`{p}checklist <name>`\n`{p}checkall`\n`{p}stop`",
+        inline=False
+    )
+    embed.add_field(
+        name="Auto Checks",
+        value=f"`{p}autocheck <minutes>`\n`{p}autostop`\n`{p}autostatus`",
+        inline=False
+    )
+    embed.add_field(
+        name="Settings",
+        value=f"`{p}setprefix <prefix>`\n`{p}ratelimit <delay_seconds> <batch_size> <batch_cooldown_seconds> <list_cooldown_seconds>`",
+        inline=False
+    )
+    embed.add_field(
+        name="Unavailable Files",
+        value=f"`{p}unavailablecount <length>`\n`{p}getunavailable <length>`\n`{p}clearunavailable [length]`",
+        inline=False
+    )
+    await ctx.send(embed=embed)
+
 
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def setup(ctx,name:str,valid_channel:discord.TextChannel,invalid_channel:discord.TextChannel,summary_channel:discord.TextChannel,log_channel:discord.TextChannel,*,words:str):
-    cleaned=parse_words(words)
-    if not cleaned: await ctx.send('No usable words found.'); return
-    if len(cleaned)>MAX_CODES_PER_LIST: await ctx.send(f'Too many words. Max is `{MAX_CODES_PER_LIST}`.'); return
-    name=name.lower(); ts=now_iso(); created=config['lists'].get(name,{}).get('created_at',ts)
-    config['lists'][name]={'valid_channel_id':valid_channel.id,'invalid_channel_id':invalid_channel.id,'summary_channel_id':summary_channel.id,'log_channel_id':log_channel.id,'words':cleaned,'created_at':created,'updated_at':ts}
-    save_config(); await ctx.send(f'✅ Setup saved for `{name}` with `{len(cleaned)}` word(s).')
+async def setprefix(ctx, new_prefix: str):
+    if len(new_prefix) > 5:
+        await ctx.send("Prefix must be 5 characters or less.")
+        return
+    config["prefix"] = new_prefix
+    save_config()
+    await ctx.send(f"Prefix changed to `{new_prefix}`. All help embeds will now show `{new_prefix}` commands.")
 
-@bot.command(name='run')
-@commands.has_permissions(administrator=True)
-async def run_cmd(ctx,name:str): await run_one(name,ctx)
+
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def runall(ctx): await run_all(ctx)
+async def ratelimit(ctx, delay_seconds: int, batch_size: int, batch_cooldown_seconds: int, list_cooldown_seconds: int):
+    if delay_seconds < 3:
+        await ctx.send("Delay must be at least `3` seconds.")
+        return
+    if batch_size < 1 or batch_size > 20:
+        await ctx.send("Batch size must be between `1` and `20`.")
+        return
+    if batch_cooldown_seconds < 10:
+        await ctx.send("Batch cooldown must be at least `10` seconds.")
+        return
+    if list_cooldown_seconds < 10:
+        await ctx.send("List cooldown must be at least `10` seconds.")
+        return
+
+    config["delay_seconds"] = delay_seconds
+    config["batch_size"] = batch_size
+    config["batch_cooldown_seconds"] = batch_cooldown_seconds
+    config["list_cooldown_seconds"] = list_cooldown_seconds
+    save_config()
+    await ctx.send(
+        "Rate settings saved:\n"
+        f"Delay: `{delay_seconds}s`\n"
+        f"Batch size: `{batch_size}`\n"
+        f"Batch cooldown: `{batch_cooldown_seconds}s`\n"
+        f"List cooldown: `{list_cooldown_seconds}s`"
+    )
+
+
 @bot.command()
-async def stop(ctx):
-    if not check_state['running']: await ctx.send('No list is currently running.'); return
-    check_state['stop_requested']=True; await ctx.send(f'Stop requested for `{check_state["list"]}`. Progress: `{check_state["current"]}/{check_state["total"]}`.')
+@commands.has_permissions(administrator=True)
+async def addlist(ctx, name: str, claim_channel: discord.TextChannel, log_channel: discord.TextChannel, summary_channel: discord.TextChannel, ping_role_input: str, *, words: str):
+    cleaned = parse_words(words)
+    if not cleaned:
+        await ctx.send("No usable words found.")
+        return
+    if len(cleaned) > MAX_CODES_PER_LIST:
+        await ctx.send(f"Too many words. Max per list is `{MAX_CODES_PER_LIST}`.")
+        return
+
+    ping_role = find_role(ctx, ping_role_input)
+    if ping_role_input.lower() not in {"none", "no", "null", "0"} and not ping_role:
+        await ctx.send("I could not find that ping role. Use a role mention, role ID, exact role name, or `none`.")
+        return
+
+    name = clean_code(name)
+    if not name:
+        await ctx.send("Invalid list name.")
+        return
+
+    timestamp = now_iso()
+    old_created = config["lists"].get(name, {}).get("created_at", timestamp)
+
+    config["lists"][name] = {
+        "claim_channel_id": claim_channel.id,
+        "log_channel_id": log_channel.id,
+        "summary_channel_id": summary_channel.id,
+        "ping_role_id": ping_role.id if ping_role else None,
+        "words": cleaned,
+        "created_at": old_created,
+        "updated_at": timestamp
+    }
+    save_config()
+
+    await ctx.send(
+        f"Saved list `{name}` with `{len(cleaned)}` word(s).\n"
+        f"Claims: {claim_channel.mention}\n"
+        f"Logs: {log_channel.mention}\n"
+        f"Summaries: {summary_channel.mention}\n"
+        f"Ping role: {ping_role.mention if ping_role else '`None`'}\n"
+        f"Updated: {format_time(timestamp)}"
+    )
+
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def addwords(ctx, name: str, *, words: str):
+    name = clean_code(name)
+    if name not in config["lists"]:
+        await ctx.send(f"No list named `{name}` exists.")
+        return
+
+    new_words = parse_words(words)
+    existing = list(config["lists"][name].get("words", []))
+    existing_set = set(existing)
+    added = []
+
+    for code in new_words:
+        if code not in existing_set:
+            existing.append(code)
+            existing_set.add(code)
+            added.append(code)
+
+    if len(existing) > MAX_CODES_PER_LIST:
+        await ctx.send(f"That would go over the max of `{MAX_CODES_PER_LIST}` words per list.")
+        return
+
+    config["lists"][name]["words"] = existing
+    config["lists"][name]["updated_at"] = now_iso()
+    save_config()
+    await ctx.send(f"Added `{len(added)}` new word(s) to `{name}`. Total: `{len(existing)}`.")
+
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def removewords(ctx, name: str, *, words: str):
+    name = clean_code(name)
+    if name not in config["lists"]:
+        await ctx.send(f"No list named `{name}` exists.")
+        return
+
+    remove_set = set(parse_words(words))
+    before = config["lists"][name].get("words", [])
+    after = [w for w in before if clean_code(w) not in remove_set]
+    removed = len(before) - len(after)
+
+    config["lists"][name]["words"] = after
+    config["lists"][name]["updated_at"] = now_iso()
+    save_config()
+    await ctx.send(f"Removed `{removed}` word(s) from `{name}`. Total: `{len(after)}`.")
+
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setchannels(ctx, name: str, claim_channel: discord.TextChannel, log_channel: discord.TextChannel, summary_channel: discord.TextChannel):
+    name = clean_code(name)
+    if name not in config["lists"]:
+        await ctx.send(f"No list named `{name}` exists.")
+        return
+
+    config["lists"][name]["claim_channel_id"] = claim_channel.id
+    config["lists"][name]["log_channel_id"] = log_channel.id
+    config["lists"][name]["summary_channel_id"] = summary_channel.id
+    config["lists"][name]["updated_at"] = now_iso()
+    save_config()
+    await ctx.send(f"Updated channels for `{name}`: claims {claim_channel.mention}, logs {log_channel.mention}, summaries {summary_channel.mention}.")
+
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setpingrole(ctx, name: str, *, role_input: str):
+    name = clean_code(name)
+    if name not in config["lists"]:
+        await ctx.send(f"No list named `{name}` exists.")
+        return
+
+    role = find_role(ctx, role_input)
+    if role_input.lower() not in {"none", "no", "null", "0"} and not role:
+        await ctx.send("I could not find that role. Use a mention, role ID, exact role name, or `none`.")
+        return
+
+    config["lists"][name]["ping_role_id"] = role.id if role else None
+    config["lists"][name]["updated_at"] = now_iso()
+    save_config()
+    await ctx.send(f"Updated ping role for `{name}` to {role.mention if role else '`None`'}.")
+
+
 @bot.command()
 async def lists(ctx):
-    if not config['lists']: await ctx.send('No saved lists yet.'); return
-    e=discord.Embed(title='Saved Lists',color=discord.Color.blurple())
-    for n,d in config['lists'].items():
-        ready,reason=list_ready(d); e.add_field(name=n,value=f'Status: `{"Ready" if ready else reason}`\nWords: `{len(d.get("words",[]))}`\nValid: <#{d.get("valid_channel_id")}>\nInvalid: <#{d.get("invalid_channel_id")}>\nSummary: <#{d.get("summary_channel_id")}>\nLog: <#{d.get("log_channel_id")}>\nUpdated: {format_time(d.get("updated_at"))}',inline=False)
-    await ctx.send(embed=e)
+    if not config["lists"]:
+        await ctx.send("No saved lists yet.")
+        return
+
+    embed = discord.Embed(title="Saved Vanity Lists", color=discord.Color.blurple())
+    for name, data in config["lists"].items():
+        embed.add_field(
+            name=name,
+            value=(
+                f"Words: `{len(data.get('words', []))}`\n"
+                f"Claims: <#{data.get('claim_channel_id')}>\n"
+                f"Logs: <#{data.get('log_channel_id')}>\n"
+                f"Summaries: <#{data.get('summary_channel_id')}>\n"
+                f"Ping: {f'<@&{data.get('ping_role_id')}>' if data.get('ping_role_id') else '`None`'}\n"
+                f"Updated: {format_time(data.get('updated_at'))}"
+            ),
+            inline=False
+        )
+    await ctx.send(embed=embed)
+
+
 @bot.command()
-async def status(ctx,name:str):
-    name=name.lower()
-    if name not in config['lists']: await ctx.send(f'No list named `{name}` exists.'); return
-    d=config['lists'][name]; ready,reason=list_ready(d); preview=', '.join(d.get('words',[])[:30]);
-    if len(d.get('words',[]))>30: preview+='...'
-    e=discord.Embed(title=f'Status: {name}',color=discord.Color.green() if ready else discord.Color.orange())
-    e.add_field(name='Ready',value='Yes' if ready else reason,inline=False); e.add_field(name='Words',value=str(len(d.get('words',[]))),inline=True); e.add_field(name='Valid',value=f'<#{d.get("valid_channel_id")}>',inline=True); e.add_field(name='Invalid',value=f'<#{d.get("invalid_channel_id")}>',inline=True); e.add_field(name='Summary',value=f'<#{d.get("summary_channel_id")}>',inline=True); e.add_field(name='Log',value=f'<#{d.get("log_channel_id")}>',inline=True); e.add_field(name='Updated',value=format_time(d.get('updated_at')),inline=False); e.add_field(name='Preview',value=preview or 'None',inline=False)
-    await ctx.send(embed=e)
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def words(ctx,name:str,*,words:str):
-    name=name.lower()
-    if name not in config['lists']: await ctx.send(f'No list named `{name}` exists.'); return
-    cleaned=parse_words(words)
-    if not cleaned: await ctx.send('No usable words found.'); return
-    config['lists'][name]['words']=cleaned; config['lists'][name]['updated_at']=now_iso(); save_config(); await ctx.send(f'✅ Replaced `{name}` with `{len(cleaned)}` word(s).')
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def append(ctx,name:str,*,words:str):
-    name=name.lower()
-    if name not in config['lists']: await ctx.send(f'No list named `{name}` exists.'); return
-    cur=config['lists'][name].get('words',[]); seen=set(cur); added=[]
-    for w in parse_words(words):
-        if w not in seen: cur.append(w); seen.add(w); added.append(w)
-    if len(cur)>MAX_CODES_PER_LIST: await ctx.send(f'This would exceed max `{MAX_CODES_PER_LIST}`.'); return
-    config['lists'][name]['words']=cur; config['lists'][name]['updated_at']=now_iso(); save_config(); await ctx.send(f'✅ Added `{len(added)}` word(s). Total: `{len(cur)}`.')
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def remove_words(ctx,name:str,*,words:str):
-    name=name.lower()
-    if name not in config['lists']: await ctx.send(f'No list named `{name}` exists.'); return
-    rem=set(parse_words(words)); old=config['lists'][name].get('words',[]); new=[w for w in old if w not in rem]
-    config['lists'][name]['words']=new; config['lists'][name]['updated_at']=now_iso(); save_config(); await ctx.send(f'✅ Removed `{len(old)-len(new)}` word(s). Total: `{len(new)}`.')
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def remove_list(ctx,name:str):
-    name=name.lower()
-    if name not in config['lists']: await ctx.send(f'No list named `{name}` exists.'); return
-    del config['lists'][name]; save_config(); await ctx.send(f'✅ Removed `{name}`.')
-@bot.command()
-async def gettxt(ctx,category:str,length:int=None):
-    category=category.lower(); ensure_dirs()
-    if category=='all': files=sorted(TXT_DIR.glob('*.txt'))
-    elif category in ('valid','invalid') and length is None: files=sorted(TXT_DIR.glob(f'{category}_*_letters.txt'))
-    elif category in ('valid','invalid'): files=[TXT_DIR/f'{category}_{length}_letters.txt']
-    else: await ctx.send('Use `valid`, `invalid`, or `all`. Example: `!gettxt invalid 3`'); return
-    files=[p for p in files if p.exists()]
-    if not files: await ctx.send('No matching txt files found yet. Run a check first.'); return
-    for p in files:
-        await ctx.send(file=discord.File(str(p),filename=p.name)); await asyncio.sleep(1)
+async def listinfo(ctx, name: str):
+    name = clean_code(name)
+    if name not in config["lists"]:
+        await ctx.send(f"No list named `{name}` exists.")
+        return
+
+    data = config["lists"][name]
+    embed = discord.Embed(title=f"List Info: {name}", color=discord.Color.blurple())
+    embed.add_field(name="Words", value=str(len(data.get("words", []))), inline=True)
+    embed.add_field(name="Created", value=format_time(data.get("created_at")), inline=False)
+    embed.add_field(name="Last Updated", value=format_time(data.get("updated_at")), inline=False)
+    embed.add_field(name="Claim Channel", value=f"<#{data.get('claim_channel_id')}>", inline=True)
+    embed.add_field(name="Log Channel", value=f"<#{data.get('log_channel_id')}>", inline=True)
+    embed.add_field(name="Summary Channel", value=f"<#{data.get('summary_channel_id')}>", inline=True)
+    embed.add_field(name="Ping Role", value=f"<@&{data.get('ping_role_id')}>" if data.get("ping_role_id") else "None", inline=True)
+
+    preview = ", ".join(data.get("words", [])[:35])
+    if len(data.get("words", [])) > 35:
+        preview += "..."
+    embed.add_field(name="Word Preview", value=preview or "None", inline=False)
+    await ctx.send(embed=embed)
+
+
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def autocheck(ctx,minutes:int):
-    if minutes<MIN_AUTO_MINUTES: await ctx.send(f'Use at least `{MIN_AUTO_MINUTES}` minutes.'); return
-    config['auto_enabled']=True; config['auto_minutes']=minutes; save_config(); auto_loop.counter=0; await ctx.send(f'✅ Auto checks enabled every `{minutes}` minute(s).')
+async def removelist(ctx, name: str):
+    name = clean_code(name)
+    if name not in config["lists"]:
+        await ctx.send(f"No list named `{name}` exists.")
+        return
+    del config["lists"][name]
+    save_config()
+    await ctx.send(f"Removed list `{name}`.")
+
+
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def autostop(ctx): config.update(auto_enabled=False); save_config(); await ctx.send('✅ Auto checks disabled.')
+async def clearlists(ctx):
+    config["lists"] = {}
+    save_config()
+    await ctx.send("Removed all saved lists.")
+
+
 @bot.command()
-async def autostatus(ctx): await ctx.send(f'Auto checks: `{"Enabled" if config["auto_enabled"] else "Disabled"}`\nInterval: `{config["auto_minutes"]}` minute(s)\nSaved lists: `{len(config["lists"])}`\nRunning: `{"Yes" if check_state["running"] else "No"}`\nLocked: `{"Yes" if check_lock.locked() else "No"}`\nWord delay: `{WORD_DELAY_SECONDS}s`\nBatch cooldown: `{BATCH_COOLDOWN_SECONDS}s every {BATCH_SIZE}`\nList cooldown: `{format_duration(LIST_COOLDOWN_SECONDS)}`')
+@commands.has_permissions(administrator=True)
+async def checklist(ctx, name: str):
+    name = clean_code(name)
+    if name not in config["lists"]:
+        await ctx.send(f"No list named `{name}` exists.")
+        return
+    if check_state["running"]:
+        await ctx.send(f"A check is already running: `{check_state['mode']}` `{check_state['current']}/{check_state['total']}`")
+        return
+    await ctx.send(f"Starting check for `{name}`.")
+    load_unavailable_cache()
+    await run_list_check(name, config["lists"][name], manual_ctx=ctx)
+
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def checkall(ctx):
+    await ctx.send("Starting all saved list checks.")
+    await run_all_checks(manual_ctx=ctx)
+
+
+@bot.command()
+async def stop(ctx):
+    if not check_state["running"]:
+        await ctx.send("No check is currently running.")
+        return
+    check_state["stop_requested"] = True
+    await ctx.send(f"Stop requested for `{check_state['mode']}`. Progress: `{check_state['current']}/{check_state['total']}`")
+
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def autocheck(ctx, minutes: int):
+    if minutes < 15:
+        await ctx.send("Use at least `15` minutes to reduce rate-limit/Cloudflare issues.")
+        return
+    config["auto_enabled"] = True
+    config["auto_minutes"] = minutes
+    save_config()
+    auto_check_loop.counter = 0
+    await ctx.send(f"Automatic checks enabled every `{minutes}` minute(s).")
+
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def autostop(ctx):
+    config["auto_enabled"] = False
+    save_config()
+    await ctx.send("Automatic checks disabled.")
+
+
+@bot.command()
+async def autostatus(ctx):
+    await ctx.send(
+        f"Auto checks: `{'Enabled' if config['auto_enabled'] else 'Disabled'}`\n"
+        f"Interval: `{config['auto_minutes']}` minute(s)\n"
+        f"Saved lists: `{len(config['lists'])}`\n"
+        f"Currently running: `{'Yes' if check_state['running'] else 'No'}`\n"
+        f"Delay: `{config['delay_seconds']}s` | Batch: `{config['batch_size']}` | Batch cooldown: `{config['batch_cooldown_seconds']}s`"
+    )
+
+
+@bot.command(name="unavailablecount", aliases=["invalidcount"])
+async def unavailablecount(ctx, length: int):
+    if length < 1 or length > 32:
+        await ctx.send("Use a length between 1 and 32.")
+        return
+    load_unavailable_cache()
+    await ctx.send(f"{length}-letter unavailable count: `{len(unavailable_cache[length])}`")
+
+
+@bot.command(name="getunavailable", aliases=["getinvalid"])
+async def getunavailable(ctx, length: int):
+    if length < 1 or length > 32:
+        await ctx.send("Use a length between 1 and 32.")
+        return
+    load_unavailable_cache()
+    rewrite_unavailable_file(length)
+    path = unavailable_file(length)
+    await ctx.send(content=f"Unavailable file for `{length}` letters:", file=discord.File(str(path), filename=path.name))
+
+
+@bot.command(name="clearunavailable", aliases=["clearinvalid"])
+@commands.has_permissions(administrator=True)
+async def clearunavailable(ctx, length: int = None):
+    load_unavailable_cache()
+    if length is None:
+        for l in TRACKED_LENGTHS:
+            unavailable_cache[l].clear()
+            rewrite_unavailable_file(l)
+        await ctx.send("Cleared all unavailable files.")
+        return
+    if length < 1 or length > 32:
+        await ctx.send("Use a length between 1 and 32.")
+        return
+    unavailable_cache[length].clear()
+    rewrite_unavailable_file(length)
+    await ctx.send(f"Cleared unavailable file for `{length}` letters.")
+
+
+@bot.command()
+@commands.has_permissions(manage_messages=True)
+async def purge(ctx, amount: int):
+    if amount < 1 or amount > 100:
+        await ctx.send("Use an amount between `1` and `100`.")
+        return
+    deleted = await ctx.channel.purge(limit=amount + 1)
+    msg = await ctx.send(f"Deleted `{len(deleted) - 1}` messages.")
+    await asyncio.sleep(3)
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+# =========================
+# ERROR HANDLING / STARTUP
+# =========================
 
 @bot.event
-async def on_command_error(ctx,error):
-    if isinstance(error,commands.CommandNotFound): return
-    if isinstance(error,commands.MissingPermissions): await ctx.send('You need administrator permission to use that.'); return
-    if isinstance(error,commands.MissingRequiredArgument): await ctx.send(f'Missing something. Use `{PREFIX}help` for syntax.'); return
-    if isinstance(error,commands.BadArgument): await ctx.send(f'Bad format. Mention channels like `#valid`. Use `{PREFIX}help`.'); return
-    log.exception('Command error: %s',error); await ctx.send('An error happened, but the bot is still running. Check logs or use `!help`.')
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("You do not have permission to use that command.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"Missing argument: `{error.param.name}`. Run `{config.get('prefix', DEFAULT_PREFIX)}help`.")
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send(f"Bad argument. Run `{config.get('prefix', DEFAULT_PREFIX)}help` and check the command format.")
+    elif isinstance(error, commands.CommandNotFound):
+        return
+    else:
+        logger.exception("Command error: %s", error)
+        await ctx.send(f"Command error: `{short_text(error, 500)}`")
+
+
 @bot.event
 async def on_ready():
-    ensure_dirs(); load_config()
-    if not auto_loop.is_running(): auto_loop.start()
-    log.info('Logged in as %s | saved lists: %s',bot.user,len(config['lists']))
-if not TOKEN: raise RuntimeError('DISCORD_TOKEN is missing. Add it to Railway variables.')
-bot.run(TOKEN)
+    ensure_dirs()
+    ensure_unavailable_files()
+    load_config()
+    load_unavailable_cache()
+
+    if not auto_check_loop.is_running():
+        auto_check_loop.start()
+
+    logger.info("Logged in as %s | Prefix: %s", bot.user, config.get("prefix", DEFAULT_PREFIX))
+
+
+if __name__ == "__main__":
+    ensure_dirs()
+    load_config()
+    if not TOKEN:
+        raise RuntimeError("DISCORD_TOKEN is missing from environment variables. Add it in Railway Variables.")
+    bot.run(TOKEN)
