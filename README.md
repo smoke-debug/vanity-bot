@@ -47,7 +47,7 @@ Railway start command: `python bot.py`
 
 ## 30-Day Countdown Update
 
-This version includes an active/expired countdown tracker for vanities that change from not taken/available to taken/on-server.
+This version includes an active/expired countdown tracker for vanities that change from taken/on-server to not taken/available.
 
 Main new commands:
 
@@ -61,11 +61,14 @@ Main new commands:
 - `!invalidcount`
 - `!invalidexport`
 - `!backfillinvalid [messages_per_log_channel]`
+- `!backfillchannel #channel [message_limit]`
+- `!backfillstatus [#channel]`
+- `!resetbackfill #channel`
 
 See `README_COUNTDOWN_UPDATE.txt` for details.
 
 Countdown channel backfill update
 ---------------------------------
-Use `!backfillchannel #log 5000` to scan a specific Discord channel for old transition messages and create countdowns from the Discord message timestamps.
+Use `!backfillchannel #log 5000` to incrementally scan a specific Discord channel for old transition messages and create countdowns from the Discord message timestamps. Running it again skips the already-scanned range, catches newer messages, then continues farther back into older unscanned history.
 
 To keep lists after Railway redeploys, attach a Railway Volume and set `DATA_DIR=/data`.
