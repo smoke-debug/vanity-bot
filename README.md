@@ -63,3 +63,9 @@ Main new commands:
 - `!backfillinvalid [messages_per_log_channel]`
 
 See `README_COUNTDOWN_UPDATE.txt` for details.
+
+Countdown channel backfill update
+---------------------------------
+Use `!backfillchannel #log 5000` to scan a specific Discord channel for old transition messages and create countdowns from the Discord message timestamps.
+
+To keep lists after Railway redeploys, attach a Railway Volume and set `DATA_DIR=/data`.

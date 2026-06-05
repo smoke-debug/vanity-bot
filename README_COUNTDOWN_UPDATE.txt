@@ -1,30 +1,32 @@
-Vanity Bot Countdown Update
-===========================
+Vanity Bot Countdown + Channel Backfill Update
+=============================================
 
-This package adds a 30-day countdown tracker to the existing vanity checker.
+This package updates the countdown tracker and adds a manual channel backfill command.
 
 Tracker behavior
 ----------------
-The countdown starts only when the bot detects this exact transition:
+The countdown now starts when the bot detects this transition:
 
-    not taken / available (404) -> taken / on-server (200)
+    taken / on-server (200) -> not taken / available (404)
 
-This is detected when a vanity was already saved in the not-taken TXT files and a new check sees it as taken.
+That is the same log message shown as:
 
-The active record is saved in:
+    discord.gg/example is not taken/available and was added to the not-taken TXT file.
+
+The active countdown is saved in:
 
     data/invalid_vanities.json
 
-When the 30-day timer ends, the record is moved into:
+When the 30-day timer ends, it moves into:
 
     data/expired_invalid_vanities.json
 
-The expired record includes when the timer expired.
+The expired record includes the exact timer expiration time.
 
-If a vanity becomes not taken / available again, it is automatically removed from the active or expired tracker.
+If the vanity becomes taken/on-server again, the bot removes it from active and expired tracking.
 
-New commands
-------------
+New / updated commands
+----------------------
 !setalertchannel #channel
     Sets the channel where @everyone completion alerts are sent.
 
@@ -51,22 +53,49 @@ New commands
 !invalidexport
     Exports active and expired countdown data as JSON.
 
-!backfillinvalid [messages_per_log_channel]
-    Scans configured log channels for old transition messages and rebuilds countdowns from Discord message timestamps.
-    Default scan size is 5000 messages per log channel.
+!backfillchannel #channel [message_limit]
+    Scans any channel you choose for old bot log messages.
+    This is the fix for cases where saved log channels are missing.
+    Example:
+        !backfillchannel #log 5000
 
-Backfill notes
---------------
-Backfill uses messages like:
+!backfillinvalid [messages_per_log_channel]
+    Scans saved list log channels, if your saved lists have log channels configured.
+    If it says no log channels are found, use !backfillchannel instead.
+
+Backfill behavior
+-----------------
+Backfill scans messages like:
+
+    discord.gg/example is not taken/available and was added to the not-taken TXT file.
+
+The Discord message timestamp becomes the countdown start time.
+
+If the scan sees a later message like:
 
     discord.gg/example is taken/on a server and was removed from the not-taken TXT file.
 
-Those messages are created only when the bot detected available -> taken, so their Discord timestamps are used as the countdown start time.
+then the countdown is removed, because the vanity became taken/on-server again.
 
 Old timers that already expired before this update are moved into the expired list, but the bot does not @everyone ping for old backfilled expirations to avoid spam.
 
-Railway notes
--------------
-Keep your existing DISCORD_TOKEN variable.
-No new environment variables are required.
-Use !setalertchannel after deployment to choose the alert channel.
+Data persistence / Railway notes
+--------------------------------
+The bot saves lists and countdowns automatically in the data folder:
+
+    data/vanity_config.json
+    data/invalid_vanities.json
+    data/expired_invalid_vanities.json
+    data/unavailable_vanities/*.txt
+
+The code will not delete saved lists unless you use commands like !removelist or !clearlists.
+
+For Railway updates/redeploys, attach a Railway Volume and set this environment variable:
+
+    DATA_DIR=/data
+
+Then mount the volume to /data in Railway. Without a persistent Railway volume, files written at runtime can be lost during redeploys.
+
+The bot also creates safety backups of vanity_config.json in:
+
+    data/backups/
