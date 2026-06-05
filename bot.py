@@ -95,6 +95,12 @@ config = {
     "batch_cooldown_seconds": DEFAULT_BATCH_COOLDOWN_SECONDS,
     "list_cooldown_seconds": DEFAULT_LIST_COOLDOWN_SECONDS,
     "invalid_alert_channel_id": None,
+    # Countdown filters. Use !setcountdownlengths to change these.
+    # This prevents bad backfill data like discord.gg/a from polluting the tracker.
+    "min_countdown_length": int(os.getenv("MIN_COUNTDOWN_LENGTH", "2")),
+    "max_countdown_length": int(os.getenv("MAX_COUNTDOWN_LENGTH", "32")),
+    # When true, !topcountdowns verifies candidates against Discord before showing them.
+    "topcountdowns_live_verify": True,
     "lists": {}
 }
 
@@ -318,6 +324,15 @@ def load_config() -> None:
     config["batch_cooldown_seconds"] = int(loaded.get("batch_cooldown_seconds", DEFAULT_BATCH_COOLDOWN_SECONDS))
     config["list_cooldown_seconds"] = int(loaded.get("list_cooldown_seconds", DEFAULT_LIST_COOLDOWN_SECONDS))
     config["invalid_alert_channel_id"] = loaded.get("invalid_alert_channel_id")
+    try:
+        config["min_countdown_length"] = max(1, min(32, int(loaded.get("min_countdown_length", config.get("min_countdown_length", 2)))))
+    except Exception:
+        config["min_countdown_length"] = 2
+    try:
+        config["max_countdown_length"] = max(config["min_countdown_length"], min(32, int(loaded.get("max_countdown_length", config.get("max_countdown_length", 32)))))
+    except Exception:
+        config["max_countdown_length"] = 32
+    config["topcountdowns_live_verify"] = bool(loaded.get("topcountdowns_live_verify", config.get("topcountdowns_live_verify", True)))
 
     loaded_lists = loaded.get("lists", {}) if isinstance(loaded.get("lists", {}), dict) else {}
     config["lists"] = {clean_code(name): normalize_list_record(data) for name, data in loaded_lists.items() if clean_code(name)}
@@ -344,6 +359,60 @@ def clean_code(item: Any) -> str:
     text = text.lower()
     text = re.sub(r"[^a-z0-9_-]", "", text)
     return text
+
+
+def countdown_length_bounds() -> tuple[int, int]:
+    try:
+        min_len = max(1, min(32, int(config.get("min_countdown_length", 2))))
+    except Exception:
+        min_len = 2
+    try:
+        max_len = max(min_len, min(32, int(config.get("max_countdown_length", 32))))
+    except Exception:
+        max_len = 32
+    return min_len, max_len
+
+
+def is_countdown_trackable(code: Any) -> bool:
+    code = clean_code(code)
+    if not code:
+        return False
+    min_len, max_len = countdown_length_bounds()
+    return min_len <= len(code) <= max_len
+
+
+def countdown_filter_label() -> str:
+    min_len, max_len = countdown_length_bounds()
+    if min_len == max_len:
+        return f"{min_len} chars only"
+    return f"{min_len}-{max_len} chars"
+
+
+def prune_countdown_tracker_by_length(*, save: bool = True) -> dict:
+    removed_active = []
+    removed_expired = []
+    for code in list(active_invalid_vanities.keys()):
+        if not is_countdown_trackable(code):
+            active_invalid_vanities.pop(code, None)
+            removed_active.append(code)
+    for code in list(expired_invalid_vanities.keys()):
+        if not is_countdown_trackable(code):
+            expired_invalid_vanities.pop(code, None)
+            removed_expired.append(code)
+    if save and (removed_active or removed_expired):
+        save_invalid_tracker()
+        write_event_log("countdowns_pruned_by_length", {
+            "filter": countdown_filter_label(),
+            "removed_active": len(removed_active),
+            "removed_expired": len(removed_expired),
+            "sample_active": removed_active[:50],
+            "sample_expired": removed_expired[:50],
+        })
+    return {
+        "removed_active": len(removed_active),
+        "removed_expired": len(removed_expired),
+        "filter": countdown_filter_label(),
+    }
 
 
 def parse_words(words: str) -> list[str]:
@@ -465,7 +534,7 @@ def write_json_file(path: Path, data, *, label: Optional[str] = None, backup: bo
 
 def normalize_tracker_record(code: str, record: dict, *, expired: bool = False) -> Optional[dict]:
     code = clean_code(code or record.get("code", ""))
-    if not code:
+    if not code or not is_countdown_trackable(code):
         return None
 
     taken_at_dt = parse_iso_dt(record.get("taken_at") or record.get("invalid_at"))
@@ -571,7 +640,7 @@ def extract_transition_events_from_message(message: discord.Message, channel_lab
 
     for match in AVAILABLE_TRANSITION_RE.finditer(content):
         code = clean_code(match.group(1))
-        if code:
+        if code and is_countdown_trackable(code):
             events.append({
                 "event_type": "available",
                 "code": code,
@@ -586,7 +655,7 @@ def extract_transition_events_from_message(message: discord.Message, channel_lab
     for pattern in (TAKEN_TRANSITION_RE, TAKEN_STATUS_RE):
         for match in pattern.finditer(content):
             code = clean_code(match.group(1))
-            if code and code not in seen_taken_codes:
+            if code and is_countdown_trackable(code) and code not in seen_taken_codes:
                 seen_taken_codes.add(code)
                 events.append({
                     "event_type": "taken",
@@ -655,7 +724,7 @@ def replay_stored_backfill_events_to_tracker() -> dict:
         event_dt = parse_iso_dt(event.get("event_at"))
         code = clean_code(event.get("code", ""))
         event_type = str(event.get("event_type", "")).lower()
-        if event_dt and code and event_type in {"available", "taken"}:
+        if event_dt and code and is_countdown_trackable(code) and event_type in {"available", "taken"}:
             timeline.append((event_dt, int(event.get("message_id", 0)), event_type, code, event.get("source", "backfill")))
 
     timeline.sort(key=lambda item: (item[0], item[1]))
@@ -778,20 +847,57 @@ def make_tracker_record(code: str, list_name: str, taken_at: Optional[str] = Non
 
 
 def add_invalid_vanity(code: str, list_name: str, taken_at: Optional[str] = None, source: str = "checker") -> dict:
-    """Start a 30-day countdown after taken/on-server -> not-taken/available."""
+    """Start/reset a 30-day countdown after taken/on-server -> not-taken/available.
+
+    If an active countdown already exists, only reset it when the new not-taken
+    timestamp is newer than the saved start time. This keeps countdowns based on
+    the most recent log/check that showed the vanity became not-taken/available.
+    """
     code = clean_code(code)
-    if not code:
+    if not code or not is_countdown_trackable(code):
+        write_event_log("countdown_skipped_untrackable_length", {"code": code, "filter": countdown_filter_label(), "source": source})
         return {}
 
     # A fresh not-taken transition should remove any old expired record for the same code.
     removed_expired = expired_invalid_vanities.pop(code, None) is not None
 
-    if code in active_invalid_vanities:
-        active_invalid_vanities[code]["updated_at"] = now_iso()
-        save_invalid_tracker()
-        return active_invalid_vanities[code]
-
     record = make_tracker_record(code, list_name, taken_at=taken_at, source=source)
+    incoming_dt = parse_iso_dt(record.get("taken_at") or record.get("invalid_at"))
+
+    existing = active_invalid_vanities.get(code)
+    if existing:
+        existing_dt = parse_iso_dt(existing.get("taken_at") or existing.get("invalid_at"))
+
+        # Same or older transition: do not move the countdown backwards.
+        if existing_dt and incoming_dt and incoming_dt <= existing_dt:
+            existing["updated_at"] = now_iso()
+            existing["last_seen_available_at"] = incoming_dt.isoformat()
+            existing["last_seen_available_source"] = source
+            save_invalid_tracker()
+            write_event_log("countdown_kept_existing_newer", {
+                "code": code,
+                "existing_taken_at": existing.get("taken_at"),
+                "incoming_taken_at": record.get("taken_at"),
+                "source": source,
+            })
+            return existing
+
+        # Newer not-taken transition: reset the countdown to the most recent log/check.
+        record["previous_taken_at"] = existing.get("taken_at")
+        record["reset_at"] = now_iso()
+        record["reset_reason"] = "newer_not_taken_transition"
+        active_invalid_vanities[code] = record
+        save_invalid_tracker()
+        write_event_log("countdown_reset_to_newer_available_transition", {
+            "code": code,
+            "list": list_name,
+            "source": source,
+            "old_taken_at": existing.get("taken_at"),
+            "new_taken_at": record.get("taken_at"),
+            "new_expires_at": record.get("expires_at"),
+        })
+        return record
+
     active_invalid_vanities[code] = record
     save_invalid_tracker()
     write_event_log("countdown_started", {
@@ -952,13 +1058,14 @@ def build_top_shortest_countdowns_embed(limit: int = 50) -> discord.Embed:
     records = active_sorted_expiring()[:limit]
     embed = discord.Embed(
         title=f"Top {limit} Shortest Vanity Countdowns",
-        description="Active countdowns sorted by the least time remaining.",
+        description="Active countdowns sorted by the least time remaining. The command live-verifies candidates before displaying when enabled.",
         color=discord.Color.orange(),
     )
     embed.add_field(name="Active Countdowns", value=str(len(active_invalid_vanities)), inline=True)
     embed.add_field(name="Showing", value=str(len(records)), inline=True)
     alert_channel_id = config.get("invalid_alert_channel_id")
     embed.add_field(name="Alert Channel", value=f"<#{alert_channel_id}>" if alert_channel_id else "Not set", inline=True)
+    embed.add_field(name="Length Filter", value=f"`{countdown_filter_label()}`", inline=True)
 
     if not records:
         embed.add_field(name="No Active Countdowns", value="No vanities are currently in the active countdown tracker.", inline=False)
@@ -1043,6 +1150,84 @@ def move_due_countdowns_to_expired(*, source: str = "loop", alert_sent_default: 
             "codes": [record.get("code") for record in moved[:50]],
         })
     return moved
+
+
+async def verify_countdown_records(records: list[dict], *, max_checks: int = 100, only_remove_taken: bool = True) -> dict:
+    """Live-check active countdown records against Discord.
+
+    A countdown should only remain active while the invite returns 404 / available.
+    If Discord returns 200 / taken, the record is removed immediately.
+    """
+    max_checks = max(1, min(int(max_checks), 500))
+    checked = 0
+    kept_available = 0
+    removed_taken = 0
+    skipped_untrackable = 0
+    errors = 0
+    blocked = 0
+    samples_removed = []
+
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for record in list(records)[:max_checks]:
+            code = clean_code(record.get("code", ""))
+            if not code or code not in active_invalid_vanities:
+                continue
+            if not is_countdown_trackable(code):
+                active_invalid_vanities.pop(code, None)
+                skipped_untrackable += 1
+                continue
+
+            result, payload = await fetch_invite_status(session, code)
+            checked += 1
+            if result == "available":
+                active_invalid_vanities[code]["last_verified_at"] = now_iso()
+                active_invalid_vanities[code]["last_verified_status"] = "available"
+                kept_available += 1
+            elif result == "taken":
+                remove_invalid_vanity(code, reason="live_verify_found_taken", seen_at=now_iso(), save=False)
+                removed_taken += 1
+                samples_removed.append(code)
+            elif result == "blocked":
+                blocked += 1
+                break
+            else:
+                errors += 1
+
+            # Small safety pause so a manual verify command does not hammer the endpoint.
+            if checked < max_checks:
+                await asyncio.sleep(0.35)
+
+    if checked or removed_taken or skipped_untrackable or kept_available:
+        save_invalid_tracker()
+        write_event_log("countdowns_live_verified", {
+            "checked": checked,
+            "kept_available": kept_available,
+            "removed_taken": removed_taken,
+            "skipped_untrackable": skipped_untrackable,
+            "errors": errors,
+            "blocked": blocked,
+            "removed_sample": samples_removed[:50],
+        })
+
+    return {
+        "checked": checked,
+        "kept_available": kept_available,
+        "removed_taken": removed_taken,
+        "skipped_untrackable": skipped_untrackable,
+        "errors": errors,
+        "blocked": blocked,
+        "removed_sample": samples_removed[:20],
+    }
+
+
+async def verify_shortest_candidates_for_top(limit: int = 50) -> dict:
+    """Verify enough shortest candidates so !topcountdowns doesn't display stale taken vanities."""
+    limit = max(1, min(int(limit), 50))
+    # Check more than the display limit so taken/stale records are removed and replaced by the next shortest records.
+    candidate_records = active_sorted_expiring()[:min(len(active_invalid_vanities), max(limit, min(limit + 25, 100)))]
+    return await verify_countdown_records(candidate_records, max_checks=len(candidate_records))
+
 
 # =========================
 # DISCORD HELPERS
@@ -1376,10 +1561,16 @@ async def run_list_check(list_name: str, list_data: dict, manual_ctx=None):
                         transition_time = now_iso()
                         record = add_invalid_vanity(code, list_name, taken_at=transition_time, source="checker_available_transition")
                         await safe_send(log_channel, f"`discord.gg/{code}` is not taken/available and was added to the not-taken TXT file.")
-                        await safe_send(
-                            log_channel,
-                            f"Started 30-day countdown for `discord.gg/{code}`. Ends {discord_relative(record.get('expires_at'))}."
-                        )
+                        if record:
+                            await safe_send(
+                                log_channel,
+                                f"Started 30-day countdown for `discord.gg/{code}`. Ends {discord_relative(record.get('expires_at'))}."
+                            )
+                        else:
+                            await safe_send(
+                                log_channel,
+                                f"Skipped countdown for `discord.gg/{code}` because it does not match the countdown length filter `{countdown_filter_label()}`."
+                            )
 
                     await safe_send(available_channel, f"discord.gg/{code}")
 
@@ -1574,7 +1765,11 @@ async def help_command(ctx):
             f"`{p}invalid` - show active countdowns\n"
             f"`{p}invalid <vanity>` or `{p}countdown <vanity>` - check one countdown\n"
             f"`{p}invalidrecent [limit]` - recent active countdowns\n"
-            f"`{p}topcountdowns [limit]` - top 50 shortest countdowns\n"
+            f"`{p}topcountdowns [limit]` - top 50 shortest countdowns, live-verified before display\n"
+            f"`{p}verifycountdowns [limit]` - live-check countdowns and remove ones now taken\n"
+            f"`{p}setcountdownlengths <min> [max]` - filter/prune countdown lengths\n"
+            f"`{p}prunecountdowns` - prune saved records outside the current length filter\n"
+            f"`{p}resetcountdowns` - delete all active/expired countdowns and stored backfill events\n"
             f"`{p}invalidexpired [limit]` - expired countdown list\n"
             f"`{p}invalidcount` - active/expired totals\n"
             f"`{p}invalidexport` - export tracker JSON\n"
@@ -1968,13 +2163,122 @@ async def invalidexpiring(ctx, limit: int = 10):
 @bot.command(name="topcountdowns", aliases=["shortestcountdowns", "invalidtop", "topinvalid", "soonestcountdowns"])
 async def topcountdowns(ctx, limit: int = 50):
     """Show up to 50 active countdowns with the shortest time remaining."""
+    limit = max(1, min(int(limit), 50))
     await process_due_countdowns(source="command")
+    if config.get("topcountdowns_live_verify", True):
+        msg = await ctx.send(f"Verifying the shortest countdown candidates live before showing the top `{limit}`...")
+        stats = await verify_shortest_candidates_for_top(limit=limit)
+        try:
+            await msg.edit(content=f"Verified `{stats['checked']}` countdown candidate(s). Removed `{stats['removed_taken']}` that are now taken and `{stats['skipped_untrackable']}` outside the length filter.")
+        except Exception:
+            pass
     await ctx.send(embed=build_top_shortest_countdowns_embed(limit=limit))
 
 
 @bot.command(name="invalidexpired", aliases=["expiredinvalid"])
 async def invalidexpired(ctx, limit: int = 10):
     await ctx.send(embed=build_expired_list_embed(limit=limit))
+
+
+@bot.command(name="verifycountdowns", aliases=["verifyinvalid", "checkcountdowns"])
+@commands.has_permissions(administrator=True)
+async def verifycountdowns(ctx, limit: int = 100):
+    """Live-check active countdowns and remove any that are currently taken/on-server."""
+    limit = max(1, min(int(limit), 500))
+    await process_due_countdowns(source="command")
+    records = active_sorted_expiring()[:limit]
+    if not records:
+        await ctx.send("No active countdowns to verify.")
+        return
+    status_msg = await ctx.send(f"Live-verifying `{len(records)}` active countdown(s). This can take a bit...")
+    stats = await verify_countdown_records(records, max_checks=len(records))
+    embed = discord.Embed(title="Countdown Live Verification Complete", color=discord.Color.blurple())
+    embed.add_field(name="Checked", value=str(stats["checked"]), inline=True)
+    embed.add_field(name="Still Not Taken / Available", value=str(stats["kept_available"]), inline=True)
+    embed.add_field(name="Removed Because Taken", value=str(stats["removed_taken"]), inline=True)
+    embed.add_field(name="Removed By Length Filter", value=str(stats["skipped_untrackable"]), inline=True)
+    embed.add_field(name="Errors", value=str(stats["errors"]), inline=True)
+    embed.add_field(name="Blocks", value=str(stats["blocked"]), inline=True)
+    embed.add_field(name="Active Countdown Total", value=str(len(active_invalid_vanities)), inline=True)
+    embed.add_field(name="Length Filter", value=f"`{countdown_filter_label()}`", inline=True)
+    if stats.get("removed_sample"):
+        embed.add_field(name="Removed Sample", value=", ".join(f"`{c}`" for c in stats["removed_sample"]), inline=False)
+    try:
+        await status_msg.edit(content=None, embed=embed)
+    except Exception:
+        await ctx.send(embed=embed)
+
+
+@bot.command(name="setcountdownlengths", aliases=["setcountdownlength", "countdownlengths"])
+@commands.has_permissions(administrator=True)
+async def setcountdownlengths(ctx, min_length: int, max_length: int = None):
+    """Set which vanity lengths are allowed in the countdown tracker and prune bad saved data."""
+    if max_length is None:
+        max_length = 32
+    min_length = max(1, min(32, int(min_length)))
+    max_length = max(min_length, min(32, int(max_length)))
+    config["min_countdown_length"] = min_length
+    config["max_countdown_length"] = max_length
+    save_config()
+    stats = prune_countdown_tracker_by_length(save=True)
+    await ctx.send(
+        f"Countdown length filter set to `{countdown_filter_label()}`.\n"
+        f"Removed `{stats['removed_active']}` active countdown(s) and `{stats['removed_expired']}` expired countdown(s) outside that range."
+    )
+
+
+@bot.command(name="prunecountdowns", aliases=["cleanbadcountdowns", "cleancountdowns"])
+@commands.has_permissions(administrator=True)
+async def prunecountdowns(ctx):
+    """Remove saved countdown records outside the current length filter."""
+    stats = prune_countdown_tracker_by_length(save=True)
+    await ctx.send(
+        f"Pruned countdown tracker using filter `{stats['filter']}`.\n"
+        f"Removed `{stats['removed_active']}` active countdown(s) and `{stats['removed_expired']}` expired countdown(s)."
+    )
+
+
+@bot.command(name="resetcountdowns", aliases=["clearcountdowns", "wipecountdowns", "resetinvalids"])
+@commands.has_permissions(administrator=True)
+async def resetcountdowns(ctx):
+    """Delete all active/expired countdowns and stored backfill transition events.
+
+    This keeps saved vanity lists and channel scan cursors, but removes the stored
+    events that would recreate old countdowns on the next backfill replay.
+    """
+    active_before = len(active_invalid_vanities)
+    expired_before = len(expired_invalid_vanities)
+    events_before = len(backfill_transition_events)
+
+    active_invalid_vanities.clear()
+    expired_invalid_vanities.clear()
+    backfill_transition_events.clear()
+
+    save_invalid_tracker()
+    save_backfill_progress()
+    write_event_log("countdowns_reset_by_command", {
+        "user_id": int(ctx.author.id),
+        "guild_id": int(ctx.guild.id) if ctx.guild else None,
+        "active_removed": active_before,
+        "expired_removed": expired_before,
+        "backfill_events_removed": events_before,
+    })
+
+    embed = discord.Embed(title="Countdown Tracker Reset", color=discord.Color.orange())
+    embed.add_field(name="Active Countdowns Removed", value=str(active_before), inline=True)
+    embed.add_field(name="Expired Countdowns Removed", value=str(expired_before), inline=True)
+    embed.add_field(name="Stored Backfill Events Removed", value=str(events_before), inline=True)
+    embed.add_field(
+        name="Saved Lists",
+        value="Kept. This command does not delete your vanity lists or channel setup.",
+        inline=False,
+    )
+    embed.add_field(
+        name="Backfill Cursors",
+        value="Kept. Use `!resetbackfill #channel` if you want to rescan old channel history from scratch.",
+        inline=False,
+    )
+    await ctx.send(embed=embed)
 
 
 @bot.command(name="invalidcount")
