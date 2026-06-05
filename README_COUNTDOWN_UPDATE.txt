@@ -1,11 +1,11 @@
-Vanity Bot Countdown + Channel Backfill Update
-=============================================
+Vanity Bot Countdown + Incremental Channel Backfill Update
+=========================================================
 
-This package updates the countdown tracker and adds a manual channel backfill command.
+This package updates the countdown tracker and adds incremental backfill scanning.
 
 Tracker behavior
 ----------------
-The countdown now starts when the bot detects this transition:
+The countdown starts when the bot detects this transition:
 
     taken / on-server (200) -> not taken / available (404)
 
@@ -24,6 +24,30 @@ When the 30-day timer ends, it moves into:
 The expired record includes the exact timer expiration time.
 
 If the vanity becomes taken/on-server again, the bot removes it from active and expired tracking.
+
+Incremental backfill behavior
+-----------------------------
+Backfill progress is now saved, so running the command again does not rescan the same channel range.
+
+Saved progress files:
+
+    data/backfill_scan_state.json
+    data/backfill_transition_events.json
+
+How it works:
+
+1. First run scans up to the latest message_limit messages.
+2. Next runs skip the already-scanned range.
+3. It checks messages newer than the last scan.
+4. Then it uses the rest of the limit to continue farther back into older unscanned history.
+5. Matching transition events are stored once, so duplicate countdowns are skipped.
+6. The tracker is rebuilt from all stored transition events in chronological order.
+
+Recommended usage:
+
+    !backfillchannel #log 5000
+
+Run the same command again to continue from unscanned messages.
 
 New / updated commands
 ----------------------
@@ -54,16 +78,21 @@ New / updated commands
     Exports active and expired countdown data as JSON.
 
 !backfillchannel #channel [message_limit]
-    Scans any channel you choose for old bot log messages.
-    This is the fix for cases where saved log channels are missing.
+    Incrementally scans any channel you choose for old bot log messages.
     Example:
         !backfillchannel #log 5000
 
 !backfillinvalid [messages_per_log_channel]
-    Scans saved list log channels, if your saved lists have log channels configured.
+    Incrementally scans saved list log channels, if your saved lists have log channels configured.
     If it says no log channels are found, use !backfillchannel instead.
 
-Backfill behavior
+!backfillstatus [#channel]
+    Shows the saved scan cursor/progress for one channel or all scanned channels.
+
+!resetbackfill #channel
+    Resets only the scan cursor for a channel. Stored transition events are kept to prevent duplicate countdowns.
+
+Backfill matching
 -----------------
 Backfill scans messages like:
 
@@ -86,6 +115,8 @@ The bot saves lists and countdowns automatically in the data folder:
     data/vanity_config.json
     data/invalid_vanities.json
     data/expired_invalid_vanities.json
+    data/backfill_scan_state.json
+    data/backfill_transition_events.json
     data/unavailable_vanities/*.txt
 
 The code will not delete saved lists unless you use commands like !removelist or !clearlists.

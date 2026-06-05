@@ -4,6 +4,9 @@ import json
 import asyncio
 import logging
 import shutil
+import atexit
+import signal
+import zipfile
 from pathlib import Path
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
@@ -32,13 +35,43 @@ BLOCK_COOLDOWN_SECONDS = 600
 API_BASE = "https://discord.com/api/v10/invites"
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data"))).expanduser()
+
+
+def resolve_data_dir() -> Path:
+    """Choose the safest data folder.
+
+    Priority:
+    1. DATA_DIR env var if you set it.
+    2. /data when Railway Volume is mounted.
+    3. Local ./data folder as fallback.
+
+    Lists and countdowns are saved to this folder. For Railway redeploys, attach
+    a Volume and set DATA_DIR=/data so these files survive updates.
+    """
+    env_dir = os.getenv("DATA_DIR")
+    if env_dir:
+        return Path(env_dir).expanduser()
+
+    railway_volume = Path("/data")
+    try:
+        if railway_volume.exists() and os.access(str(railway_volume), os.W_OK):
+            return railway_volume
+    except Exception:
+        pass
+
+    return BASE_DIR / "data"
+
+
+DATA_DIR = resolve_data_dir()
 # Kept as unavailable_vanities for compatibility with your existing hosted files.
 # The contents are now NOT-TAKEN / AVAILABLE words only.
 UNAVAILABLE_DIR = DATA_DIR / "unavailable_vanities"
 CONFIG_FILE = DATA_DIR / "vanity_config.json"
 ACTIVE_INVALID_FILE = DATA_DIR / "invalid_vanities.json"
 EXPIRED_INVALID_FILE = DATA_DIR / "expired_invalid_vanities.json"
+BACKFILL_STATE_FILE = DATA_DIR / "backfill_scan_state.json"
+BACKFILL_EVENTS_FILE = DATA_DIR / "backfill_transition_events.json"
+EVENT_LOG_FILE = DATA_DIR / "bot_events.log"
 BACKUP_DIR = DATA_DIR / "backups"
 COUNTDOWN_DAYS = 30
 TRACKED_LENGTHS = range(1, 33)
@@ -80,6 +113,11 @@ unavailable_cache = defaultdict(set)
 # If the vanity becomes taken/on-server again, it is removed from active/expired tracking.
 active_invalid_vanities: dict[str, dict] = {}
 expired_invalid_vanities: dict[str, dict] = {}
+
+# Stores channel scan cursors and matched transition events so backfill commands
+# can continue from unscanned messages instead of rescanning the same history.
+backfill_scan_state: dict[str, dict] = {}
+backfill_transition_events: dict[str, dict] = {}
 
 check_state = {
     "running": False,
@@ -132,6 +170,86 @@ def backup_existing_file(path: Path, label: str, keep: int = 25) -> None:
         logger.warning("Could not create backup for %s: %s", path.name, e)
 
 
+def write_event_log(event: str, details: Optional[dict] = None) -> None:
+    """Append one JSON line to data/bot_events.log for auditing saves and transitions."""
+    try:
+        ensure_dirs()
+        payload = {
+            "at": now_iso(),
+            "event": str(event),
+            "details": details or {},
+        }
+        with open(EVENT_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception as e:
+        logger.warning("Could not write event log: %s", e)
+
+
+def latest_backup_for(label: str) -> Optional[Path]:
+    try:
+        backups = sorted(BACKUP_DIR.glob(f"{label}_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        return backups[0] if backups else None
+    except Exception:
+        return None
+
+
+def restore_latest_backup(path: Path, label: str) -> bool:
+    backup = latest_backup_for(label)
+    if not backup:
+        return False
+    try:
+        shutil.copy2(backup, path)
+        write_event_log("backup_restored", {"file": path.name, "backup": backup.name})
+        return True
+    except Exception as e:
+        logger.warning("Could not restore backup for %s from %s: %s", path.name, backup, e)
+        return False
+
+
+def atomic_write_json(path: Path, data, *, label: Optional[str] = None, backup: bool = True) -> None:
+    """Crash-safe JSON write with fsync + replace. Existing file is backed up first."""
+    ensure_dirs()
+    label = label or path.stem
+    if backup:
+        backup_existing_file(path, label)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, sort_keys=True)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    tmp_path.replace(path)
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    ensure_dirs()
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    tmp_path.replace(path)
+
+
+def save_all_data(reason: str = "manual") -> None:
+    """Save every persistent store. Safe to call from shutdown/autosave."""
+    try:
+        save_config()
+        save_invalid_tracker()
+        save_backfill_progress()
+        for length in TRACKED_LENGTHS:
+            rewrite_unavailable_file(length)
+        write_event_log("all_data_saved", {
+            "reason": reason,
+            "data_dir": str(DATA_DIR),
+            "lists": len(config.get("lists", {})),
+            "active_countdowns": len(active_invalid_vanities),
+            "expired_countdowns": len(expired_invalid_vanities),
+        })
+    except Exception as e:
+        logger.warning("save_all_data failed: %s", e)
+
+
 def normalize_list_record(data: dict) -> dict:
     """Keeps old configs working while adding separate available/taken channels."""
     if not isinstance(data, dict):
@@ -159,26 +277,38 @@ def normalize_list_record(data: dict) -> dict:
 
 
 def save_config() -> None:
-    ensure_dirs()
-    backup_existing_file(CONFIG_FILE, "vanity_config")
-    tmp_path = CONFIG_FILE.with_suffix(CONFIG_FILE.suffix + ".tmp")
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=4)
-    tmp_path.replace(CONFIG_FILE)
+    # This is called immediately after addlist/addwords/setchannels/etc.
+    # It writes atomically so lists survive normal bot restarts/crashes.
+    atomic_write_json(CONFIG_FILE, config, label="vanity_config", backup=True)
+    write_event_log("config_saved", {"lists": len(config.get("lists", {})), "file": CONFIG_FILE.name})
 
 
 def load_config() -> None:
     ensure_dirs()
     if not CONFIG_FILE.exists():
-        save_config()
-        return
+        # If a previous save exists in backups, restore it instead of starting blank.
+        if restore_latest_backup(CONFIG_FILE, "vanity_config"):
+            write_event_log("config_loaded_from_backup", {"file": CONFIG_FILE.name})
+        else:
+            save_config()
+            write_event_log("config_created", {"file": CONFIG_FILE.name})
+            return
 
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             loaded = json.load(f)
     except Exception as e:
-        logger.warning("Config failed to load, using in-memory defaults without overwriting the existing file: %s", e)
-        return
+        logger.warning("Config failed to load: %s", e)
+        if restore_latest_backup(CONFIG_FILE, "vanity_config"):
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                write_event_log("config_restored_after_load_failure", {"file": CONFIG_FILE.name})
+            except Exception as restore_error:
+                logger.warning("Restored config still failed to load: %s", restore_error)
+                return
+        else:
+            return
 
     config["prefix"] = str(loaded.get("prefix", DEFAULT_PREFIX))[:5] or DEFAULT_PREFIX
     config["auto_enabled"] = bool(loaded.get("auto_enabled", False))
@@ -191,6 +321,7 @@ def load_config() -> None:
 
     loaded_lists = loaded.get("lists", {}) if isinstance(loaded.get("lists", {}), dict) else {}
     config["lists"] = {clean_code(name): normalize_list_record(data) for name, data in loaded_lists.items() if clean_code(name)}
+    write_event_log("config_loaded", {"lists": len(config["lists"]), "data_dir": str(DATA_DIR)})
 
 
 def unavailable_file(length: int) -> Path:
@@ -242,9 +373,8 @@ def load_unavailable_cache() -> None:
 
 def rewrite_unavailable_file(length: int) -> None:
     path = unavailable_file(length)
-    with open(path, "w", encoding="utf-8") as f:
-        for code in sorted(unavailable_cache[length]):
-            f.write(code + "\n")
+    text = "".join(code + "\n" for code in sorted(unavailable_cache[length]))
+    atomic_write_text(path, text)
 
 
 def add_unavailable(code: str) -> bool:
@@ -297,25 +427,33 @@ def parse_iso_dt(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
-def read_json_file(path: Path, default):
+def read_json_file(path: Path, default, *, label: Optional[str] = None):
     ensure_dirs()
+    label = label or path.stem
     if not path.exists():
-        return default
+        if restore_latest_backup(path, label):
+            write_event_log("json_restored_from_backup", {"file": path.name, "label": label})
+        else:
+            return default
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, type(default)) else default
     except Exception as e:
         logger.warning("Failed to read %s: %s", path.name, e)
+        if restore_latest_backup(path, label):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                write_event_log("json_restored_after_read_failure", {"file": path.name, "label": label})
+                return data if isinstance(data, type(default)) else default
+            except Exception as restore_error:
+                logger.warning("Restored %s still failed to read: %s", path.name, restore_error)
         return default
 
 
-def write_json_file(path: Path, data) -> None:
-    ensure_dirs()
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4, sort_keys=True)
-    tmp_path.replace(path)
+def write_json_file(path: Path, data, *, label: Optional[str] = None, backup: bool = True) -> None:
+    atomic_write_json(path, data, label=label or path.stem, backup=backup)
 
 
 def normalize_tracker_record(code: str, record: dict, *, expired: bool = False) -> Optional[dict]:
@@ -368,8 +506,227 @@ def load_invalid_tracker() -> None:
 
 
 def save_invalid_tracker() -> None:
-    write_json_file(ACTIVE_INVALID_FILE, active_invalid_vanities)
-    write_json_file(EXPIRED_INVALID_FILE, expired_invalid_vanities)
+    write_json_file(ACTIVE_INVALID_FILE, active_invalid_vanities, label="invalid_vanities", backup=True)
+    write_json_file(EXPIRED_INVALID_FILE, expired_invalid_vanities, label="expired_invalid_vanities", backup=True)
+    write_event_log("countdowns_saved", {
+        "active": len(active_invalid_vanities),
+        "expired": len(expired_invalid_vanities),
+    })
+
+
+def load_backfill_progress() -> None:
+    """Load incremental backfill cursors and matched transition events."""
+    backfill_scan_state.clear()
+    backfill_transition_events.clear()
+
+    raw_state = read_json_file(BACKFILL_STATE_FILE, {})
+    raw_events = read_json_file(BACKFILL_EVENTS_FILE, {})
+
+    if isinstance(raw_state, dict):
+        for channel_id, state in raw_state.items():
+            if isinstance(state, dict):
+                backfill_scan_state[str(channel_id)] = state
+
+    if isinstance(raw_events, dict):
+        for event_key, event in raw_events.items():
+            if not isinstance(event, dict):
+                continue
+            code = clean_code(event.get("code", ""))
+            event_type = str(event.get("event_type", "")).lower()
+            event_at = parse_iso_dt(event.get("event_at"))
+            if not code or event_type not in {"available", "taken"} or not event_at:
+                continue
+            normalized = dict(event)
+            normalized["code"] = code
+            normalized["event_type"] = event_type
+            normalized["event_at"] = event_at.isoformat()
+            backfill_transition_events[str(event_key)] = normalized
+
+
+def save_backfill_progress() -> None:
+    write_json_file(BACKFILL_STATE_FILE, backfill_scan_state, label="backfill_scan_state", backup=True)
+    write_json_file(BACKFILL_EVENTS_FILE, backfill_transition_events, label="backfill_transition_events", backup=True)
+    write_event_log("backfill_progress_saved", {
+        "channels": len(backfill_scan_state),
+        "events": len(backfill_transition_events),
+    })
+
+
+def backfill_event_key(channel_id: int, message_id: int, event_type: str, code: str) -> str:
+    return f"{int(channel_id)}:{int(message_id)}:{event_type}:{clean_code(code)}"
+
+
+def extract_transition_events_from_message(message: discord.Message, channel_label: str) -> list[dict]:
+    """Return transition events found in one log message."""
+    content = message.content or ""
+    event_at = message.created_at.astimezone(timezone.utc)
+    events = []
+
+    for match in AVAILABLE_TRANSITION_RE.finditer(content):
+        code = clean_code(match.group(1))
+        if code:
+            events.append({
+                "event_type": "available",
+                "code": code,
+                "event_at": event_at.isoformat(),
+                "channel_id": int(message.channel.id),
+                "channel_name": getattr(message.channel, "name", "unknown"),
+                "message_id": int(message.id),
+                "source": channel_label,
+            })
+
+    for match in TAKEN_TRANSITION_RE.finditer(content):
+        code = clean_code(match.group(1))
+        if code:
+            events.append({
+                "event_type": "taken",
+                "code": code,
+                "event_at": event_at.isoformat(),
+                "channel_id": int(message.channel.id),
+                "channel_name": getattr(message.channel, "name", "unknown"),
+                "message_id": int(message.id),
+                "source": channel_label,
+            })
+
+    return events
+
+
+def update_channel_backfill_state(channel: discord.TextChannel, messages: list[discord.Message], *, initial_scan: bool, older_requested: bool) -> None:
+    """Update per-channel cursors so future scans only pull unscanned history."""
+    cid = str(channel.id)
+    state = backfill_scan_state.setdefault(cid, {})
+    state["channel_id"] = int(channel.id)
+    state["channel_name"] = getattr(channel, "name", "unknown")
+    state["guild_id"] = int(channel.guild.id) if getattr(channel, "guild", None) else None
+    state["last_scan_at"] = now_iso()
+    state["scan_runs"] = int(state.get("scan_runs", 0)) + 1
+
+    if messages:
+        sorted_messages = sorted(messages, key=lambda m: m.created_at)
+        oldest_msg = sorted_messages[0]
+        newest_msg = sorted_messages[-1]
+
+        current_oldest_id = state.get("oldest_message_id")
+        current_newest_id = state.get("newest_message_id")
+
+        if not current_oldest_id or int(oldest_msg.id) < int(current_oldest_id):
+            state["oldest_message_id"] = int(oldest_msg.id)
+            state["oldest_message_at"] = oldest_msg.created_at.astimezone(timezone.utc).isoformat()
+
+        if not current_newest_id or int(newest_msg.id) > int(current_newest_id):
+            state["newest_message_id"] = int(newest_msg.id)
+            state["newest_message_at"] = newest_msg.created_at.astimezone(timezone.utc).isoformat()
+
+    if older_requested and not messages:
+        state["older_history_complete"] = True
+
+    if initial_scan and not messages:
+        state["older_history_complete"] = True
+
+    backfill_scan_state[cid] = state
+
+
+def reset_backfill_channel_state(channel_id: int) -> bool:
+    """Remove only the saved scan cursor for one channel.
+
+    Stored transition events are kept so rescanning does not duplicate countdowns.
+    """
+    cid = str(int(channel_id))
+    had_state = cid in backfill_scan_state
+    backfill_scan_state.pop(cid, None)
+    save_backfill_progress()
+    return had_state
+
+
+def replay_stored_backfill_events_to_tracker() -> dict:
+    """Replay all stored backfill transition events chronologically and merge into tracker files."""
+    timeline = []
+    for event in backfill_transition_events.values():
+        event_dt = parse_iso_dt(event.get("event_at"))
+        code = clean_code(event.get("code", ""))
+        event_type = str(event.get("event_type", "")).lower()
+        if event_dt and code and event_type in {"available", "taken"}:
+            timeline.append((event_dt, int(event.get("message_id", 0)), event_type, code, event.get("source", "backfill")))
+
+    timeline.sort(key=lambda item: (item[0], item[1]))
+
+    reconstructed: dict[str, dict] = {}
+    removed_by_taken = set()
+    for event_dt, message_id, event_type, code, label in timeline:
+        if event_type == "available":
+            reconstructed[code] = make_tracker_record(code, label, taken_at=event_dt.isoformat(), source="backfill_available_transition")
+            reconstructed[code]["source_message_id"] = message_id
+            removed_by_taken.discard(code)
+        elif event_type == "taken":
+            reconstructed.pop(code, None)
+            removed_by_taken.add(code)
+            active_invalid_vanities.pop(code, None)
+            expired_invalid_vanities.pop(code, None)
+
+    added_active = 0
+    updated_active = 0
+    moved_expired = 0
+    replaced_expired = 0
+    kept_newer_existing = 0
+    now_dt = datetime.now(timezone.utc)
+
+    for code, record in reconstructed.items():
+        record_dt = parse_iso_dt(record.get("taken_at") or record.get("invalid_at"))
+        existing_active = active_invalid_vanities.get(code)
+        existing_expired = expired_invalid_vanities.get(code)
+        existing_active_dt = parse_iso_dt((existing_active or {}).get("taken_at") or (existing_active or {}).get("invalid_at"))
+        existing_expired_dt = parse_iso_dt((existing_expired or {}).get("taken_at") or (existing_expired or {}).get("invalid_at"))
+
+        # Do not overwrite a newer live tracker record with an older backfilled event.
+        newest_existing_dt = None
+        if existing_active_dt and existing_expired_dt:
+            newest_existing_dt = max(existing_active_dt, existing_expired_dt)
+        else:
+            newest_existing_dt = existing_active_dt or existing_expired_dt
+        if newest_existing_dt and record_dt and newest_existing_dt > record_dt:
+            kept_newer_existing += 1
+            continue
+
+        expires_dt = parse_iso_dt(record.get("expires_at"))
+        if expires_dt and expires_dt <= now_dt:
+            active_invalid_vanities.pop(code, None)
+            expired_record = dict(record)
+            expired_record["expired_at"] = expires_dt.isoformat()
+            expired_record["moved_at"] = now_iso()
+            expired_record["moved_by"] = "backfill"
+            expired_record["alert_sent"] = False
+            expired_record["alert_sent_at"] = None
+            expired_record["alert_skipped_reason"] = "Backfilled after the timer had already expired; not auto-pinged to avoid spam."
+            if code not in expired_invalid_vanities:
+                moved_expired += 1
+            else:
+                replaced_expired += 1
+            expired_invalid_vanities[code] = expired_record
+            continue
+
+        expired_invalid_vanities.pop(code, None)
+        existing = active_invalid_vanities.get(code)
+        if existing:
+            existing_dt = parse_iso_dt(existing.get("taken_at") or existing.get("invalid_at"))
+            if record_dt and (not existing_dt or record_dt != existing_dt):
+                active_invalid_vanities[code] = record
+                updated_active += 1
+        else:
+            active_invalid_vanities[code] = record
+            added_active += 1
+
+    save_invalid_tracker()
+    return {
+        "stored_events_total": len(backfill_transition_events),
+        "added_active": added_active,
+        "updated_active": updated_active,
+        "moved_expired": moved_expired,
+        "replaced_expired": replaced_expired,
+        "removed_by_taken": len(removed_by_taken),
+        "kept_newer_existing": kept_newer_existing,
+        "active_total": len(active_invalid_vanities),
+        "expired_total": len(expired_invalid_vanities),
+    }
 
 
 def make_tracker_record(code: str, list_name: str, taken_at: Optional[str] = None, source: str = "checker") -> dict:
@@ -399,14 +756,24 @@ def add_invalid_vanity(code: str, list_name: str, taken_at: Optional[str] = None
         return {}
 
     # A fresh not-taken transition should remove any old expired record for the same code.
-    expired_invalid_vanities.pop(code, None)
+    removed_expired = expired_invalid_vanities.pop(code, None) is not None
 
     if code in active_invalid_vanities:
+        active_invalid_vanities[code]["updated_at"] = now_iso()
+        save_invalid_tracker()
         return active_invalid_vanities[code]
 
     record = make_tracker_record(code, list_name, taken_at=taken_at, source=source)
     active_invalid_vanities[code] = record
     save_invalid_tracker()
+    write_event_log("countdown_started", {
+        "code": code,
+        "list": list_name,
+        "source": source,
+        "taken_at": record.get("taken_at"),
+        "expires_at": record.get("expires_at"),
+        "removed_existing_expired_record": removed_expired,
+    })
     return record
 
 
@@ -421,6 +788,13 @@ def remove_invalid_vanity(code: str, reason: str = "became_taken", seen_at: Opti
 
     if save and (active_record or expired_record):
         save_invalid_tracker()
+        write_event_log("countdown_removed", {
+            "code": code,
+            "reason": reason,
+            "seen_at": seen_at or now_iso(),
+            "had_active": bool(active_record),
+            "had_expired": bool(expired_record),
+        })
     return active_record, expired_record
 
 
@@ -583,6 +957,11 @@ def move_due_countdowns_to_expired(*, source: str = "loop", alert_sent_default: 
 
     if moved:
         save_invalid_tracker()
+        write_event_log("countdowns_moved_to_expired", {
+            "source": source,
+            "count": len(moved),
+            "codes": [record.get("code") for record in moved[:50]],
+        })
     return moved
 
 # =========================
@@ -1067,6 +1446,13 @@ async def auto_check_loop():
 async def invalid_countdown_loop():
     await process_due_countdowns(source="loop")
 
+
+@tasks.loop(minutes=2)
+async def autosave_loop():
+    # Extra safety net: saves all in-memory stores every 2 minutes.
+    # Normal commands and transitions still save immediately.
+    save_all_data(reason="autosave_loop")
+
 # =========================
 # COMMANDS
 # =========================
@@ -1111,12 +1497,15 @@ async def help_command(ctx):
             f"`{p}invalidexpired [limit]` - expired countdown list\n"
             f"`{p}invalidcount` - active/expired totals\n"
             f"`{p}invalidexport` - export tracker JSON\n"
-            f"`{p}backfillinvalid [messages_per_log_channel]` - scan saved log channels\n"
-            f"`{p}backfillchannel #channel [message_limit]` - scan any channel you choose"
+            f"`{p}backfillinvalid [messages_per_log_channel]` - incrementally scan saved log channels\n"
+            f"`{p}backfillchannel #channel [message_limit]` - incrementally scan any channel you choose\n"
+            f"`{p}backfillstatus [#channel]` - show saved scan cursor/progress\n"
+            f"`{p}resetbackfill #channel` - reset a channel scan cursor if you need to rescan"
         ),
         inline=False
     )
     embed.add_field(name="Settings", value=f"`{p}setprefix <prefix>`\n`{p}ratelimit <delay_seconds> <batch_size> <batch_cooldown_seconds> <list_cooldown_seconds>`", inline=False)
+    embed.add_field(name="Data / Saves", value=f"`{p}datastatus`\n`{p}savedata`\n`{p}exportdata`", inline=False)
     embed.add_field(name="Available TXT Files", value=f"`{p}unavailablecount <length>`\n`{p}getunavailable <length>`\n`{p}clearunavailable [length]`", inline=False)
     await ctx.send(embed=embed)
 
@@ -1547,127 +1936,155 @@ async def rebuild_countdowns_from_messages(
     *,
     list_label: str = "manual-channel",
 ) -> dict:
-    """Scan Discord messages and replay the bot's saved transition logs in chronological order.
+    """Incrementally scan chosen channels and replay stored transition events.
 
-    Countdown starts from messages like:
-        discord.gg/name is not taken/available and was added to the not-taken TXT file.
-
-    Countdown is removed by later messages like:
-        discord.gg/name is taken/on a server and was removed from the not-taken TXT file.
+    First run scans up to the latest `limit_per_channel` messages.
+    Future runs skip that scanned range, check newer messages, then continue into older
+    unscanned history using saved cursors in data/backfill_scan_state.json.
     """
-    timeline = []
+    load_backfill_progress()
+
     scanned = 0
+    new_messages_scanned = 0
+    older_messages_scanned = 0
+    initial_messages_scanned = 0
     matched_available = 0
     matched_taken = 0
+    new_events_saved = 0
+    duplicate_events = 0
     failed_channels = []
+    channel_notes = []
 
     for channel in channels:
+        cid = str(channel.id)
+        state = backfill_scan_state.get(cid, {})
+        messages: list[discord.Message] = []
+        initial_scan = not state.get("oldest_message_id") or not state.get("newest_message_id")
+        older_requested = False
+
         try:
-            async for message in channel.history(limit=limit_per_channel, oldest_first=True):
-                scanned += 1
-                content = message.content or ""
-                event_at = message.created_at.astimezone(timezone.utc)
-                channel_label = f"{list_label}:{channel.id}"
+            if initial_scan:
+                batch = [m async for m in channel.history(limit=limit_per_channel, oldest_first=True)]
+                messages.extend(batch)
+                initial_messages_scanned += len(batch)
+                # If Discord returned fewer than the requested limit, this channel likely has no older backlog.
+                if len(batch) < limit_per_channel:
+                    state["older_history_complete"] = True
+            else:
+                remaining = limit_per_channel
 
-                for match in AVAILABLE_TRANSITION_RE.finditer(content):
-                    code = clean_code(match.group(1))
-                    if code:
+                # 1) Catch messages posted after the last scan.
+                newest_id = int(state.get("newest_message_id"))
+                newer_batch = [
+                    m async for m in channel.history(
+                        limit=remaining,
+                        after=discord.Object(id=newest_id),
+                        oldest_first=True,
+                    )
+                ]
+                messages.extend(newer_batch)
+                new_messages_scanned += len(newer_batch)
+                remaining -= len(newer_batch)
+
+                # 2) Use any remaining budget to continue farther back in old history.
+                if remaining > 0 and not state.get("older_history_complete", False):
+                    older_requested = True
+                    oldest_id = int(state.get("oldest_message_id"))
+                    older_batch = [
+                        m async for m in channel.history(
+                            limit=remaining,
+                            before=discord.Object(id=oldest_id),
+                            oldest_first=False,
+                        )
+                    ]
+                    messages.extend(older_batch)
+                    older_messages_scanned += len(older_batch)
+                    if len(older_batch) == 0 or len(older_batch) < remaining:
+                        state["older_history_complete"] = True
+
+            scanned += len(messages)
+            update_channel_backfill_state(channel, messages, initial_scan=initial_scan, older_requested=older_requested)
+            # Preserve older_history_complete updates made above.
+            if state.get("older_history_complete"):
+                backfill_scan_state[cid]["older_history_complete"] = True
+
+            if not messages:
+                if state.get("older_history_complete"):
+                    channel_notes.append(f"#{getattr(channel, 'name', channel.id)}: no new messages; older history already complete")
+                else:
+                    channel_notes.append(f"#{getattr(channel, 'name', channel.id)}: no new messages found this run")
+                continue
+
+            channel_label = f"{list_label}:{channel.id}"
+            for message in messages:
+                events = extract_transition_events_from_message(message, channel_label)
+                for event in events:
+                    if event["event_type"] == "available":
                         matched_available += 1
-                        timeline.append((event_at, "available", code, channel_label))
-
-                for match in TAKEN_TRANSITION_RE.finditer(content):
-                    code = clean_code(match.group(1))
-                    if code:
+                    elif event["event_type"] == "taken":
                         matched_taken += 1
-                        timeline.append((event_at, "taken", code, channel_label))
+
+                    key = backfill_event_key(event["channel_id"], event["message_id"], event["event_type"], event["code"])
+                    if key in backfill_transition_events:
+                        duplicate_events += 1
+                    else:
+                        backfill_transition_events[key] = event
+                        new_events_saved += 1
+
         except discord.Forbidden:
             failed_channels.append(f"#{getattr(channel, 'name', channel.id)} (missing Read Message History permission)")
         except Exception as e:
             failed_channels.append(f"#{getattr(channel, 'name', channel.id)} ({short_text(e, 80)})")
 
-    timeline.sort(key=lambda item: item[0])
+    save_backfill_progress()
+    replay_stats = replay_stored_backfill_events_to_tracker()
 
-    # Replay state changes. A latest available/not-taken transition means it should be tracked.
-    # A later taken/on-server transition removes it from active and expired tracking.
-    reconstructed = {}
-    removed_by_taken = set()
-    for event_dt, event_type, code, label in timeline:
-        if event_type == "available":
-            reconstructed[code] = make_tracker_record(code, label, taken_at=event_dt.isoformat(), source="backfill_available_transition")
-            removed_by_taken.discard(code)
-        elif event_type == "taken":
-            reconstructed.pop(code, None)
-            removed_by_taken.add(code)
-            active_invalid_vanities.pop(code, None)
-            expired_invalid_vanities.pop(code, None)
-
-    added_active = 0
-    updated_active = 0
-    moved_expired = 0
-    replaced_expired = 0
-    now_dt = datetime.now(timezone.utc)
-
-    for code, record in reconstructed.items():
-        expires_dt = parse_iso_dt(record.get("expires_at"))
-        if expires_dt and expires_dt <= now_dt:
-            active_invalid_vanities.pop(code, None)
-            expired_record = dict(record)
-            expired_record["expired_at"] = expires_dt.isoformat()
-            expired_record["moved_at"] = now_iso()
-            expired_record["moved_by"] = "backfill"
-            expired_record["alert_sent"] = False
-            expired_record["alert_sent_at"] = None
-            expired_record["alert_skipped_reason"] = "Backfilled after the timer had already expired; not auto-pinged to avoid spam."
-            if code not in expired_invalid_vanities:
-                moved_expired += 1
-            else:
-                replaced_expired += 1
-            expired_invalid_vanities[code] = expired_record
-            continue
-
-        expired_invalid_vanities.pop(code, None)
-        existing = active_invalid_vanities.get(code)
-        if existing:
-            existing_dt = parse_iso_dt(existing.get("taken_at") or existing.get("invalid_at"))
-            record_dt = parse_iso_dt(record.get("taken_at") or record.get("invalid_at"))
-            if record_dt and (not existing_dt or record_dt != existing_dt):
-                active_invalid_vanities[code] = record
-                updated_active += 1
-        else:
-            active_invalid_vanities[code] = record
-            added_active += 1
-
-    save_invalid_tracker()
     return {
         "scanned": scanned,
+        "initial_messages_scanned": initial_messages_scanned,
+        "new_messages_scanned": new_messages_scanned,
+        "older_messages_scanned": older_messages_scanned,
         "matched_available": matched_available,
         "matched_taken": matched_taken,
-        "added_active": added_active,
-        "updated_active": updated_active,
-        "moved_expired": moved_expired,
-        "replaced_expired": replaced_expired,
-        "removed_by_taken": len(removed_by_taken),
-        "active_total": len(active_invalid_vanities),
-        "expired_total": len(expired_invalid_vanities),
+        "new_events_saved": new_events_saved,
+        "duplicate_events": duplicate_events,
+        "stored_events_total": replay_stats.get("stored_events_total", len(backfill_transition_events)),
+        "added_active": replay_stats.get("added_active", 0),
+        "updated_active": replay_stats.get("updated_active", 0),
+        "moved_expired": replay_stats.get("moved_expired", 0),
+        "replaced_expired": replay_stats.get("replaced_expired", 0),
+        "removed_by_taken": replay_stats.get("removed_by_taken", 0),
+        "kept_newer_existing": replay_stats.get("kept_newer_existing", 0),
+        "active_total": replay_stats.get("active_total", len(active_invalid_vanities)),
+        "expired_total": replay_stats.get("expired_total", len(expired_invalid_vanities)),
         "failed_channels": failed_channels,
+        "channel_notes": channel_notes,
     }
 
 
 def build_backfill_result_embed(title: str, stats: dict) -> discord.Embed:
     embed = discord.Embed(title=title, color=discord.Color.green())
-    embed.add_field(name="Messages Scanned", value=str(stats.get("scanned", 0)), inline=True)
+    embed.add_field(name="Messages Scanned This Run", value=str(stats.get("scanned", 0)), inline=True)
+    embed.add_field(name="Initial / New / Older", value=f"`{stats.get('initial_messages_scanned', 0)}` / `{stats.get('new_messages_scanned', 0)}` / `{stats.get('older_messages_scanned', 0)}`", inline=True)
+    embed.add_field(name="New Events Saved", value=str(stats.get("new_events_saved", 0)), inline=True)
     embed.add_field(name="Not-Taken Transitions Found", value=str(stats.get("matched_available", 0)), inline=True)
     embed.add_field(name="Taken Transitions Found", value=str(stats.get("matched_taken", 0)), inline=True)
+    embed.add_field(name="Duplicate Events Skipped", value=str(stats.get("duplicate_events", 0)), inline=True)
+    embed.add_field(name="Stored Events Total", value=str(stats.get("stored_events_total", 0)), inline=True)
     embed.add_field(name="Active Added", value=str(stats.get("added_active", 0)), inline=True)
     embed.add_field(name="Active Updated", value=str(stats.get("updated_active", 0)), inline=True)
     embed.add_field(name="Moved To Expired", value=str(stats.get("moved_expired", 0)), inline=True)
     embed.add_field(name="Taken Removals Replayed", value=str(stats.get("removed_by_taken", 0)), inline=True)
+    embed.add_field(name="Kept Newer Existing", value=str(stats.get("kept_newer_existing", 0)), inline=True)
     embed.add_field(name="Active Total", value=str(stats.get("active_total", 0)), inline=True)
     embed.add_field(name="Expired Total", value=str(stats.get("expired_total", 0)), inline=True)
     failed = stats.get("failed_channels") or []
     if failed:
         embed.add_field(name="Skipped Channels", value="\n".join(failed[:8]), inline=False)
-    embed.set_footer(text="Backfill starts countdowns from 'not taken/available and was added' messages. Old expired timers are saved but not @everyone pinged.")
+    notes = stats.get("channel_notes") or []
+    if notes:
+        embed.add_field(name="Channel Notes", value="\n".join(notes[:8]), inline=False)
+    embed.set_footer(text="Incremental backfill skips already-scanned ranges, catches newer messages, then continues older history. Old expired timers are saved but not @everyone pinged.")
     return embed
 
 
@@ -1687,6 +2104,63 @@ async def backfillchannel(ctx, channel: discord.TextChannel, limit_per_channel: 
     )
     stats = await rebuild_countdowns_from_messages([channel], limit_per_channel, list_label=f"manual:{channel.name}")
     await status_msg.edit(content=None, embed=build_backfill_result_embed("Manual Channel Backfill Complete", stats))
+
+
+
+@bot.command(name="backfillstatus", aliases=["backfillprogress"])
+async def backfillstatus(ctx, channel: Optional[discord.TextChannel] = None):
+    """Show saved incremental backfill scan progress."""
+    load_backfill_progress()
+    embed = discord.Embed(title="Backfill Scan Progress", color=discord.Color.blurple())
+    embed.add_field(name="Stored Transition Events", value=str(len(backfill_transition_events)), inline=True)
+
+    states = backfill_scan_state
+    if channel:
+        states = {str(channel.id): backfill_scan_state.get(str(channel.id), {})}
+
+    if not states or (channel and not states.get(str(channel.id))):
+        embed.add_field(
+            name="No Progress Saved",
+            value="No incremental cursor is saved for that channel yet. Run `!backfillchannel #channel 5000` first.",
+            inline=False,
+        )
+        await ctx.send(embed=embed)
+        return
+
+    for cid, state in list(states.items())[:10]:
+        if not state:
+            continue
+        older_done = "Yes" if state.get("older_history_complete") else "No"
+        oldest = discord_relative(state.get("oldest_message_at")) if state.get("oldest_message_at") else "Unknown"
+        newest = discord_relative(state.get("newest_message_at")) if state.get("newest_message_at") else "Unknown"
+        embed.add_field(
+            name=f"#{state.get('channel_name', cid)}",
+            value=(
+                f"Channel: <#{cid}>\n"
+                f"Scan runs: `{state.get('scan_runs', 0)}`\n"
+                f"Oldest scanned: {oldest}\n"
+                f"Newest scanned: {newest}\n"
+                f"Older history complete: `{older_done}`\n"
+                f"Last scan: {discord_relative(state.get('last_scan_at')) if state.get('last_scan_at') else 'Unknown'}"
+            ),
+            inline=False,
+        )
+
+    embed.set_footer(text="Backfill skips the saved scanned range, checks newer messages, then continues older history.")
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="resetbackfill", aliases=["resetbackfillchannel"])
+@commands.has_permissions(administrator=True)
+async def resetbackfill(ctx, channel: discord.TextChannel):
+    """Reset a channel scan cursor so the next backfill can rescan from the latest messages."""
+    load_backfill_progress()
+    had_state = reset_backfill_channel_state(channel.id)
+    await ctx.send(
+        f"Backfill cursor for {channel.mention} has been reset. "
+        f"Stored transition events were kept to prevent duplicate countdowns. "
+        f"Previous cursor existed: `{'Yes' if had_state else 'No'}`"
+    )
 
 
 @bot.command(name="backfillinvalid")
@@ -1766,6 +2240,87 @@ async def clearunavailable(ctx, length: int = None):
     await ctx.send(f"Cleared not-taken/available TXT file for `{length}` letters.")
 
 
+def file_size_label(path: Path) -> str:
+    try:
+        size = path.stat().st_size
+    except Exception:
+        return "missing"
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / (1024 * 1024):.1f} MB"
+
+
+@bot.command(name="datastatus", aliases=["savestatus", "persistence"])
+async def datastatus(ctx):
+    load_config()
+    load_invalid_tracker()
+    load_backfill_progress()
+
+    uses_volume = str(DATA_DIR).startswith("/data")
+    embed = discord.Embed(title="Vanity Bot Data Status", color=discord.Color.blurple())
+    embed.add_field(name="Data Folder", value=f"`{DATA_DIR}`", inline=False)
+    embed.add_field(name="Railway Volume Path", value="`Yes`" if uses_volume else "`No / local fallback`", inline=True)
+    embed.add_field(name="Saved Lists", value=f"`{len(config.get('lists', {}))}`", inline=True)
+    embed.add_field(name="Active Countdowns", value=f"`{len(active_invalid_vanities)}`", inline=True)
+    embed.add_field(name="Expired Countdowns", value=f"`{len(expired_invalid_vanities)}`", inline=True)
+    embed.add_field(name="Backfill Channels", value=f"`{len(backfill_scan_state)}`", inline=True)
+    embed.add_field(name="Backfill Events", value=f"`{len(backfill_transition_events)}`", inline=True)
+
+    files = [
+        CONFIG_FILE, ACTIVE_INVALID_FILE, EXPIRED_INVALID_FILE,
+        BACKFILL_STATE_FILE, BACKFILL_EVENTS_FILE, EVENT_LOG_FILE,
+    ]
+    file_lines = [f"`{path.name}` — {file_size_label(path)}" for path in files]
+    embed.add_field(name="Saved Files", value="\n".join(file_lines), inline=False)
+    if not uses_volume:
+        embed.add_field(
+            name="Important",
+            value="For Railway redeploy/update persistence, attach a Railway Volume and set `DATA_DIR=/data`. Normal restarts still save to the folder above.",
+            inline=False,
+        )
+    embed.set_footer(text="Commands and transitions save immediately; an autosave also runs every 2 minutes.")
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="savedata", aliases=["forcesave"])
+@commands.has_permissions(administrator=True)
+async def savedata(ctx):
+    save_all_data(reason=f"manual_command_by_{ctx.author.id}")
+    await ctx.send(
+        "Saved all data now:\n"
+        f"Lists: `{len(config.get('lists', {}))}`\n"
+        f"Active countdowns: `{len(active_invalid_vanities)}`\n"
+        f"Expired countdowns: `{len(expired_invalid_vanities)}`\n"
+        f"Data folder: `{DATA_DIR}`"
+    )
+
+
+@bot.command(name="exportdata", aliases=["backupdata"])
+@commands.has_permissions(administrator=True)
+async def exportdata(ctx):
+    save_all_data(reason=f"export_command_by_{ctx.author.id}")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    export_path = DATA_DIR / f"vanity_bot_data_export_{timestamp}.zip"
+
+    with zipfile.ZipFile(export_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in DATA_DIR.rglob("*"):
+            if path.is_file() and path != export_path:
+                try:
+                    zf.write(path, arcname=str(path.relative_to(DATA_DIR)))
+                except Exception:
+                    pass
+
+    await ctx.send(
+        content=(
+            "Here is a full data backup. Keep this before major Railway updates/redeploys.\n"
+            f"Lists: `{len(config.get('lists', {}))}` | Active: `{len(active_invalid_vanities)}` | Expired: `{len(expired_invalid_vanities)}`"
+        ),
+        file=discord.File(str(export_path), filename=export_path.name),
+    )
+
+
 @bot.command()
 @commands.has_permissions(manage_messages=True)
 async def purge(ctx, amount: int):
@@ -1800,26 +2355,64 @@ async def on_command_error(ctx, error):
 
 
 @bot.event
+async def on_disconnect():
+    # Discord disconnects can happen during restarts/redeploys. Save current in-memory data.
+    save_all_data(reason="discord_disconnect")
+
+
+@bot.event
+async def on_resumed():
+    write_event_log("discord_resumed", {"data_dir": str(DATA_DIR)})
+
+
+@bot.event
 async def on_ready():
     ensure_dirs()
     ensure_unavailable_files()
     load_config()
     load_unavailable_cache()
     load_invalid_tracker()
+    load_backfill_progress()
 
     if not auto_check_loop.is_running():
         auto_check_loop.start()
     if not invalid_countdown_loop.is_running():
         invalid_countdown_loop.start()
+    if not autosave_loop.is_running():
+        autosave_loop.start()
 
     await process_due_countdowns(source="startup")
+    save_all_data(reason="startup_sync")
 
-    logger.info("Logged in as %s | Prefix: %s", bot.user, config.get("prefix", DEFAULT_PREFIX))
+    logger.info(
+        "Logged in as %s | Prefix: %s | Data dir: %s | Lists: %s | Active countdowns: %s | Expired countdowns: %s",
+        bot.user,
+        config.get("prefix", DEFAULT_PREFIX),
+        DATA_DIR,
+        len(config.get("lists", {})),
+        len(active_invalid_vanities),
+        len(expired_invalid_vanities),
+    )
+
+def handle_shutdown_signal(signum=None, frame=None):
+    save_all_data(reason=f"shutdown_signal_{signum}")
+
+
+atexit.register(lambda: save_all_data(reason="atexit"))
+try:
+    signal.signal(signal.SIGTERM, handle_shutdown_signal)
+    signal.signal(signal.SIGINT, handle_shutdown_signal)
+except Exception:
+    pass
 
 
 if __name__ == "__main__":
     ensure_dirs()
     load_config()
+    load_unavailable_cache()
+    load_invalid_tracker()
+    load_backfill_progress()
+    write_event_log("bot_process_starting", {"data_dir": str(DATA_DIR), "lists": len(config.get("lists", {}))})
     if not TOKEN:
         raise RuntimeError("DISCORD_TOKEN is missing from environment variables. Add it in Railway Variables.")
     bot.run(TOKEN)

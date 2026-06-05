@@ -1,74 +1,151 @@
-# Vanity Checker Bot - Final Slow/Safe Version
+# Vanity Checker Bot
 
-## Channels
-- `#valid` = invite exists / already on a server
-- `#invalid` = invite does not exist / not on a server
-- `#summary` = complete summary embeds and full txt files
-- `#log` = progress, cooldowns, and errors
+Discord invite vanity checker with saved lists, not-taken TXT files, countdown tracking, incremental backfill, and persistent autosaves.
 
-## Setup
+## Railway Start Command
+
 ```txt
-!setup 3letters #valid #invalid #summary #log abc, lol, pmo, vip
+python bot.py
 ```
 
-## Run
+The included `Procfile` already uses:
+
 ```txt
-!run 3letters
-!runall
+worker: python bot.py
 ```
 
-## Add more words without replacing
+## Required Railway Variable
+
 ```txt
-!append 3letters new, more, words
+DISCORD_TOKEN=your_bot_token
 ```
 
-## Replace list
+Optional:
+
 ```txt
-!words 3letters new, full, replacement, list
+BOT_PREFIX=!
+DATA_DIR=/data
 ```
 
-## Get latest txt files
+## Important: keeping data after updates/redeploys
+
+The bot automatically saves lists and countdowns, but Railway can wipe normal project folders during redeploys. For true update/redeploy persistence:
+
+1. Add a Railway Volume.
+2. Mount it at `/data`.
+3. Set `DATA_DIR=/data` in Railway variables.
+4. Restart the bot.
+5. Run `!datastatus` and confirm it says Railway Volume Path: `Yes`.
+
+If you do not use a Railway Volume, normal bot restarts may keep data, but redeploys/updates can still wipe it.
+
+## Setup a List
+
 ```txt
-!gettxt valid 3
-!gettxt invalid 3
-!gettxt valid
-!gettxt invalid
-!gettxt all
+!addlist <name> <available_channel> <taken_channel> <log_channel> <summary_channel> <ping_role|none> <words>
 ```
 
-## Auto
+Example:
+
 ```txt
-!autocheck 30
+!addlist 8letter #available #taken #log #summary none aviation, awakened, backpack
+```
+
+## Manage Lists
+
+```txt
+!lists
+!listinfo <name>
+!addwords <name> <words>
+!removewords <name> <words>
+!setchannels <name> <available> <taken> <log> <summary>
+!setpingrole <name> <role|none>
+!removelist <name>
+!clearlists
+```
+
+Lists save immediately to `data/vanity_config.json`.
+
+## Run Checks
+
+```txt
+!checklist <name>
+!checkall
+!stop
+```
+
+## Auto Checks
+
+```txt
+!autocheck <minutes>
 !autostop
 !autostatus
 ```
 
-Railway start command: `python bot.py`
+## 30-Day Countdown Tracker
 
-## 30-Day Countdown Update
+The countdown starts when the bot detects:
 
-This version includes an active/expired countdown tracker for vanities that change from taken/on-server to not taken/available.
+```txt
+taken/on-server -> not taken/available
+```
 
-Main new commands:
+It moves completed timers into the expired list and shows the expiration time.
 
-- `!setalertchannel #channel`
-- `!invalid`
-- `!invalid <vanity>`
-- `!countdown <vanity>`
-- `!invalidrecent [limit]`
-- `!invalidexpiring [limit]`
-- `!invalidexpired [limit]`
-- `!invalidcount`
-- `!invalidexport`
-- `!backfillinvalid [messages_per_log_channel]`
-- `!backfillchannel #channel [message_limit]`
-- `!backfillstatus [#channel]`
-- `!resetbackfill #channel`
+```txt
+!setalertchannel #channel
+!invalid
+!invalid <vanity>
+!countdown <vanity>
+!invalidrecent [limit]
+!invalidexpiring [limit]
+!invalidexpired [limit]
+!expiredinvalid [limit]
+!invalidcount
+!invalidexport
+```
 
-See `README_COUNTDOWN_UPDATE.txt` for details.
+Countdowns save immediately to:
 
-Countdown channel backfill update
----------------------------------
-Use `!backfillchannel #log 5000` to incrementally scan a specific Discord channel for old transition messages and create countdowns from the Discord message timestamps. Running it again skips the already-scanned range, catches newer messages, then continues farther back into older unscanned history.
+```txt
+data/invalid_vanities.json
+data/expired_invalid_vanities.json
+```
 
-To keep lists after Railway redeploys, attach a Railway Volume and set `DATA_DIR=/data`.
+## Backfill Old Log Messages
+
+Scan saved list log channels:
+
+```txt
+!backfillinvalid 5000
+```
+
+Scan a specific channel you choose:
+
+```txt
+!backfillchannel #log 5000
+```
+
+Check progress:
+
+```txt
+!backfillstatus #log
+```
+
+Reset only the scan cursor for a channel:
+
+```txt
+!resetbackfill #log
+```
+
+Backfill is incremental. Running `!backfillchannel #log 5000` again skips already-scanned messages, catches newer messages, then continues older unscanned history.
+
+## Data / Saves
+
+```txt
+!datastatus
+!savedata
+!exportdata
+```
+
+The bot saves immediately after important actions, autosaves every 2 minutes, saves on Discord disconnect, saves on shutdown signals, and keeps JSON backups in `data/backups`.
