@@ -409,6 +409,13 @@ TAKEN_TRANSITION_RE = re.compile(
     r"`?discord\.gg/([A-Za-z0-9_-]+)`?\s+is taken/on a server and was removed from the not-taken TXT file",
     re.I,
 )
+# Also treat normal per-check taken lines as a latest "taken" update.
+# Example: 8 letters | Taken/on server: `discord.gg/example`
+# This prevents backfill from keeping a countdown if a newer log message says the vanity is currently taken.
+TAKEN_STATUS_RE = re.compile(
+    r"(?:\d+\s+letters\s*\|\s*)?Taken/on server:\s*`?discord\.gg/([A-Za-z0-9_-]+)`?",
+    re.I,
+)
 AVAILABLE_TRANSITION_RE = re.compile(
     r"`?discord\.gg/([A-Za-z0-9_-]+)`?\s+is not taken/available and was added to the not-taken TXT file",
     re.I,
@@ -575,18 +582,21 @@ def extract_transition_events_from_message(message: discord.Message, channel_lab
                 "source": channel_label,
             })
 
-    for match in TAKEN_TRANSITION_RE.finditer(content):
-        code = clean_code(match.group(1))
-        if code:
-            events.append({
-                "event_type": "taken",
-                "code": code,
-                "event_at": event_at.isoformat(),
-                "channel_id": int(message.channel.id),
-                "channel_name": getattr(message.channel, "name", "unknown"),
-                "message_id": int(message.id),
-                "source": channel_label,
-            })
+    seen_taken_codes = set()
+    for pattern in (TAKEN_TRANSITION_RE, TAKEN_STATUS_RE):
+        for match in pattern.finditer(content):
+            code = clean_code(match.group(1))
+            if code and code not in seen_taken_codes:
+                seen_taken_codes.add(code)
+                events.append({
+                    "event_type": "taken",
+                    "code": code,
+                    "event_at": event_at.isoformat(),
+                    "channel_id": int(message.channel.id),
+                    "channel_name": getattr(message.channel, "name", "unknown"),
+                    "message_id": int(message.id),
+                    "source": channel_label,
+                })
 
     return events
 
@@ -652,12 +662,29 @@ def replay_stored_backfill_events_to_tracker() -> dict:
 
     reconstructed: dict[str, dict] = {}
     removed_by_taken = set()
+    latest_event_by_code: dict[str, dict] = {}
     for event_dt, message_id, event_type, code, label in timeline:
+        latest_event_by_code[code] = {
+            "event_type": event_type,
+            "event_at": event_dt.isoformat(),
+            "message_id": message_id,
+            "source": label,
+        }
         if event_type == "available":
             reconstructed[code] = make_tracker_record(code, label, taken_at=event_dt.isoformat(), source="backfill_available_transition")
             reconstructed[code]["source_message_id"] = message_id
             removed_by_taken.discard(code)
         elif event_type == "taken":
+            reconstructed.pop(code, None)
+            removed_by_taken.add(code)
+            active_invalid_vanities.pop(code, None)
+            expired_invalid_vanities.pop(code, None)
+
+    # Safety pass: only keep countdown candidates whose most recent stored update is "available".
+    # If the newest scanned log for a vanity says it is taken/on-server, do not create/keep a countdown.
+    for code in list(reconstructed.keys()):
+        latest = latest_event_by_code.get(code, {})
+        if latest.get("event_type") != "available":
             reconstructed.pop(code, None)
             removed_by_taken.add(code)
             active_invalid_vanities.pop(code, None)
@@ -723,6 +750,7 @@ def replay_stored_backfill_events_to_tracker() -> dict:
         "moved_expired": moved_expired,
         "replaced_expired": replaced_expired,
         "removed_by_taken": len(removed_by_taken),
+        "skipped_latest_taken": len(removed_by_taken),
         "kept_newer_existing": kept_newer_existing,
         "active_total": len(active_invalid_vanities),
         "expired_total": len(expired_invalid_vanities),
@@ -2054,6 +2082,7 @@ async def rebuild_countdowns_from_messages(
         "moved_expired": replay_stats.get("moved_expired", 0),
         "replaced_expired": replay_stats.get("replaced_expired", 0),
         "removed_by_taken": replay_stats.get("removed_by_taken", 0),
+        "skipped_latest_taken": replay_stats.get("skipped_latest_taken", replay_stats.get("removed_by_taken", 0)),
         "kept_newer_existing": replay_stats.get("kept_newer_existing", 0),
         "active_total": replay_stats.get("active_total", len(active_invalid_vanities)),
         "expired_total": replay_stats.get("expired_total", len(expired_invalid_vanities)),
@@ -2074,7 +2103,7 @@ def build_backfill_result_embed(title: str, stats: dict) -> discord.Embed:
     embed.add_field(name="Active Added", value=str(stats.get("added_active", 0)), inline=True)
     embed.add_field(name="Active Updated", value=str(stats.get("updated_active", 0)), inline=True)
     embed.add_field(name="Moved To Expired", value=str(stats.get("moved_expired", 0)), inline=True)
-    embed.add_field(name="Taken Removals Replayed", value=str(stats.get("removed_by_taken", 0)), inline=True)
+    embed.add_field(name="Latest Taken / Skipped", value=str(stats.get("skipped_latest_taken", stats.get("removed_by_taken", 0))), inline=True)
     embed.add_field(name="Kept Newer Existing", value=str(stats.get("kept_newer_existing", 0)), inline=True)
     embed.add_field(name="Active Total", value=str(stats.get("active_total", 0)), inline=True)
     embed.add_field(name="Expired Total", value=str(stats.get("expired_total", 0)), inline=True)
@@ -2084,7 +2113,7 @@ def build_backfill_result_embed(title: str, stats: dict) -> discord.Embed:
     notes = stats.get("channel_notes") or []
     if notes:
         embed.add_field(name="Channel Notes", value="\n".join(notes[:8]), inline=False)
-    embed.set_footer(text="Incremental backfill skips already-scanned ranges, catches newer messages, then continues older history. Old expired timers are saved but not @everyone pinged.")
+    embed.set_footer(text="Backfill only keeps countdowns when the newest scanned update for that vanity is not-taken/available. If a newer log says taken/on-server, it is skipped/removed.")
     return embed
 
 
