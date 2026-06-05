@@ -44,3 +44,22 @@
 ```
 
 Railway start command: `python bot.py`
+
+## 30-Day Countdown Update
+
+This version includes an active/expired countdown tracker for vanities that change from not taken/available to taken/on-server.
+
+Main new commands:
+
+- `!setalertchannel #channel`
+- `!invalid`
+- `!invalid <vanity>`
+- `!countdown <vanity>`
+- `!invalidrecent [limit]`
+- `!invalidexpiring [limit]`
+- `!invalidexpired [limit]`
+- `!invalidcount`
+- `!invalidexport`
+- `!backfillinvalid [messages_per_log_channel]`
+
+See `README_COUNTDOWN_UPDATE.txt` for details.

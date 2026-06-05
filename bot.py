@@ -5,7 +5,7 @@ import asyncio
 import logging
 from pathlib import Path
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple, Any
 
 import aiohttp
@@ -36,6 +36,9 @@ DATA_DIR = BASE_DIR / "data"
 # The contents are now NOT-TAKEN / AVAILABLE words only.
 UNAVAILABLE_DIR = DATA_DIR / "unavailable_vanities"
 CONFIG_FILE = DATA_DIR / "vanity_config.json"
+ACTIVE_INVALID_FILE = DATA_DIR / "invalid_vanities.json"
+EXPIRED_INVALID_FILE = DATA_DIR / "expired_invalid_vanities.json"
+COUNTDOWN_DAYS = 30
 TRACKED_LENGTHS = range(1, 33)
 
 logging.basicConfig(
@@ -56,6 +59,7 @@ config = {
     "batch_size": DEFAULT_BATCH_SIZE,
     "batch_cooldown_seconds": DEFAULT_BATCH_COOLDOWN_SECONDS,
     "list_cooldown_seconds": DEFAULT_LIST_COOLDOWN_SECONDS,
+    "invalid_alert_channel_id": None,
     "lists": {}
 }
 
@@ -68,6 +72,11 @@ bot = commands.Bot(command_prefix=get_prefix, intents=intents, help_command=None
 
 # Stores not-taken / available words, even though older command/file names say unavailable.
 unavailable_cache = defaultdict(set)
+
+# Active countdowns start when a vanity goes from available/not-taken (404) to taken/on-server (200).
+# Expired countdowns are moved out of the active tracker after 30 days.
+active_invalid_vanities: dict[str, dict] = {}
+expired_invalid_vanities: dict[str, dict] = {}
 
 check_state = {
     "running": False,
@@ -154,6 +163,7 @@ def load_config() -> None:
     config["batch_size"] = int(loaded.get("batch_size", DEFAULT_BATCH_SIZE))
     config["batch_cooldown_seconds"] = int(loaded.get("batch_cooldown_seconds", DEFAULT_BATCH_COOLDOWN_SECONDS))
     config["list_cooldown_seconds"] = int(loaded.get("list_cooldown_seconds", DEFAULT_LIST_COOLDOWN_SECONDS))
+    config["invalid_alert_channel_id"] = loaded.get("invalid_alert_channel_id")
 
     loaded_lists = loaded.get("lists", {}) if isinstance(loaded.get("lists", {}), dict) else {}
     config["lists"] = {clean_code(name): normalize_list_record(data) for name, data in loaded_lists.items() if clean_code(name)}
@@ -238,6 +248,316 @@ def remove_unavailable(code: str) -> bool:
     return False
 
 # =========================
+# INVALID / TAKEN COUNTDOWN TRACKER
+# =========================
+
+TAKEN_TRANSITION_RE = re.compile(
+    r"`?discord\.gg/([A-Za-z0-9_-]+)`?\s+is taken/on a server and was removed from the not-taken TXT file",
+    re.I,
+)
+AVAILABLE_TRANSITION_RE = re.compile(
+    r"`?discord\.gg/([A-Za-z0-9_-]+)`?\s+is not taken/available and was added to the not-taken TXT file",
+    re.I,
+)
+
+
+def parse_iso_dt(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def read_json_file(path: Path, default):
+    ensure_dirs()
+    if not path.exists():
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, type(default)) else default
+    except Exception as e:
+        logger.warning("Failed to read %s: %s", path.name, e)
+        return default
+
+
+def write_json_file(path: Path, data) -> None:
+    ensure_dirs()
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, sort_keys=True)
+    tmp_path.replace(path)
+
+
+def normalize_tracker_record(code: str, record: dict, *, expired: bool = False) -> Optional[dict]:
+    code = clean_code(code or record.get("code", ""))
+    if not code:
+        return None
+
+    taken_at_dt = parse_iso_dt(record.get("taken_at") or record.get("invalid_at"))
+    if not taken_at_dt:
+        return None
+
+    expires_at_dt = parse_iso_dt(record.get("expires_at")) or (taken_at_dt + timedelta(days=COUNTDOWN_DAYS))
+    output = dict(record)
+    output["code"] = code
+    output["taken_at"] = taken_at_dt.isoformat()
+    output["expires_at"] = expires_at_dt.isoformat()
+    output["length"] = int(output.get("length") or len(code))
+    output.setdefault("list", "unknown")
+    output.setdefault("source", "tracker")
+    output.setdefault("created_at", output["taken_at"])
+    output.setdefault("updated_at", now_iso())
+
+    if expired:
+        output.setdefault("expired_at", output["expires_at"])
+        output.setdefault("moved_at", now_iso())
+        output.setdefault("alert_sent", False)
+        output.setdefault("alert_sent_at", None)
+    return output
+
+
+def load_invalid_tracker() -> None:
+    active_invalid_vanities.clear()
+    expired_invalid_vanities.clear()
+
+    raw_active = read_json_file(ACTIVE_INVALID_FILE, {})
+    raw_expired = read_json_file(EXPIRED_INVALID_FILE, {})
+
+    for code, record in raw_active.items():
+        if isinstance(record, dict):
+            normalized = normalize_tracker_record(code, record, expired=False)
+            if normalized:
+                active_invalid_vanities[normalized["code"]] = normalized
+
+    for code, record in raw_expired.items():
+        if isinstance(record, dict):
+            normalized = normalize_tracker_record(code, record, expired=True)
+            if normalized:
+                expired_invalid_vanities[normalized["code"]] = normalized
+
+
+def save_invalid_tracker() -> None:
+    write_json_file(ACTIVE_INVALID_FILE, active_invalid_vanities)
+    write_json_file(EXPIRED_INVALID_FILE, expired_invalid_vanities)
+
+
+def make_tracker_record(code: str, list_name: str, taken_at: Optional[str] = None, source: str = "checker") -> dict:
+    code = clean_code(code)
+    taken_dt = parse_iso_dt(taken_at) or datetime.now(timezone.utc)
+    expires_dt = taken_dt + timedelta(days=COUNTDOWN_DAYS)
+    timestamp = now_iso()
+    return {
+        "code": code,
+        "taken_at": taken_dt.isoformat(),
+        "expires_at": expires_dt.isoformat(),
+        "length": len(code),
+        "list": list_name or "unknown",
+        "source": source,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+    }
+
+
+def add_invalid_vanity(code: str, list_name: str, taken_at: Optional[str] = None, source: str = "checker") -> dict:
+    """Start a 30-day countdown after available/not-taken -> taken/on-server."""
+    code = clean_code(code)
+    if not code:
+        return {}
+
+    # A fresh taken transition should remove any old expired record for the same code.
+    expired_invalid_vanities.pop(code, None)
+
+    if code in active_invalid_vanities:
+        return active_invalid_vanities[code]
+
+    record = make_tracker_record(code, list_name, taken_at=taken_at, source=source)
+    active_invalid_vanities[code] = record
+    save_invalid_tracker()
+    return record
+
+
+def remove_invalid_vanity(code: str, reason: str = "became_available", seen_at: Optional[str] = None, save: bool = True) -> tuple[Optional[dict], Optional[dict]]:
+    """Remove countdown records when the vanity becomes available/not-taken again."""
+    code = clean_code(code)
+    if not code:
+        return None, None
+
+    active_record = active_invalid_vanities.pop(code, None)
+    expired_record = expired_invalid_vanities.pop(code, None)
+
+    if save and (active_record or expired_record):
+        save_invalid_tracker()
+    return active_record, expired_record
+
+
+def seconds_until(iso_time: Optional[str]) -> int:
+    dt = parse_iso_dt(iso_time)
+    if not dt:
+        return 0
+    return int((dt - datetime.now(timezone.utc)).total_seconds())
+
+
+def format_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or days:
+        parts.append(f"{hours}h")
+    parts.append(f"{minutes}m")
+    return " ".join(parts)
+
+
+def discord_relative(iso_time: Optional[str]) -> str:
+    dt = parse_iso_dt(iso_time)
+    if not dt:
+        return "Unknown"
+    unix = int(dt.timestamp())
+    return f"<t:{unix}:F> • <t:{unix}:R>"
+
+
+def active_sorted_recent() -> list[dict]:
+    return sorted(
+        active_invalid_vanities.values(),
+        key=lambda r: parse_iso_dt(r.get("taken_at")) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+
+
+def active_sorted_expiring() -> list[dict]:
+    return sorted(
+        active_invalid_vanities.values(),
+        key=lambda r: parse_iso_dt(r.get("expires_at")) or datetime.max.replace(tzinfo=timezone.utc),
+    )
+
+
+def expired_sorted_recent() -> list[dict]:
+    return sorted(
+        expired_invalid_vanities.values(),
+        key=lambda r: parse_iso_dt(r.get("expired_at")) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+
+
+def build_invalid_detail_embed(record: dict, *, expired: bool = False) -> discord.Embed:
+    code = record.get("code", "unknown")
+    color = discord.Color.orange() if not expired else discord.Color.dark_gray()
+    title = f"Countdown {'Expired' if expired else 'Active'}: discord.gg/{code}"
+    embed = discord.Embed(title=title, color=color)
+    embed.add_field(name="Vanity", value=f"`discord.gg/{code}`", inline=False)
+    embed.add_field(name="Started When", value="Available / not taken → Taken / on server", inline=False)
+    embed.add_field(name="Taken Since", value=discord_relative(record.get("taken_at")), inline=False)
+    embed.add_field(name="30-Day Timer Ends", value=discord_relative(record.get("expires_at")), inline=False)
+    if expired:
+        embed.add_field(name="Timer Expired", value=discord_relative(record.get("expired_at") or record.get("expires_at")), inline=False)
+    else:
+        remaining = seconds_until(record.get("expires_at"))
+        embed.add_field(name="Live Countdown", value=f"`{format_duration(remaining)}` remaining • <t:{int(parse_iso_dt(record.get('expires_at')).timestamp())}:R>", inline=False)
+    embed.add_field(name="List", value=f"`{record.get('list', 'unknown')}`", inline=True)
+    embed.add_field(name="Length", value=f"`{record.get('length', len(code))}`", inline=True)
+    embed.set_footer(text="Countdowns are based on when this bot detected available/not-taken → taken/on-server.")
+    return embed
+
+
+def build_active_list_embed(limit: int = 10, *, recent: bool = True) -> discord.Embed:
+    limit = max(1, min(int(limit), 25))
+    records = active_sorted_recent() if recent else active_sorted_expiring()
+    shown = records[:limit]
+    embed = discord.Embed(
+        title="Active Vanity Countdowns",
+        description="Tracking vanities that changed from not taken/available to taken/on-server.",
+        color=discord.Color.orange(),
+    )
+    embed.add_field(name="Active", value=str(len(active_invalid_vanities)), inline=True)
+    embed.add_field(name="Expired Saved", value=str(len(expired_invalid_vanities)), inline=True)
+    alert_channel_id = config.get("invalid_alert_channel_id")
+    embed.add_field(name="Alert Channel", value=f"<#{alert_channel_id}>" if alert_channel_id else "Not set", inline=True)
+
+    if not shown:
+        embed.add_field(name="No Active Countdowns", value="No vanities are currently in the active countdown tracker.", inline=False)
+        return embed
+
+    lines = []
+    for idx, record in enumerate(shown, start=1):
+        code = record.get("code", "unknown")
+        expires_dt = parse_iso_dt(record.get("expires_at"))
+        expires_unix = int(expires_dt.timestamp()) if expires_dt else 0
+        remaining = format_duration(seconds_until(record.get("expires_at")))
+        lines.append(f"`{idx}.` `discord.gg/{code}` — `{remaining}` left • <t:{expires_unix}:R>")
+    embed.add_field(name="Recent" if recent else "Expiring Soon", value="\n".join(lines), inline=False)
+    embed.set_footer(text=f"Use {config.get('prefix', DEFAULT_PREFIX)}invalid <vanity> for one exact countdown.")
+    return embed
+
+
+def build_expired_list_embed(limit: int = 10) -> discord.Embed:
+    limit = max(1, min(int(limit), 25))
+    records = expired_sorted_recent()[:limit]
+    embed = discord.Embed(
+        title="Expired Vanity Countdown List",
+        description="These moved out of active tracking after their 30-day timer ended.",
+        color=discord.Color.dark_gray(),
+    )
+    embed.add_field(name="Expired Saved", value=str(len(expired_invalid_vanities)), inline=True)
+
+    if not records:
+        embed.add_field(name="No Expired Countdowns", value="No completed countdowns have been moved here yet.", inline=False)
+        return embed
+
+    lines = []
+    for idx, record in enumerate(records, start=1):
+        code = record.get("code", "unknown")
+        expired_dt = parse_iso_dt(record.get("expired_at") or record.get("expires_at"))
+        expired_unix = int(expired_dt.timestamp()) if expired_dt else 0
+        lines.append(f"`{idx}.` `discord.gg/{code}` — expired <t:{expired_unix}:F> • <t:{expired_unix}:R>")
+    embed.add_field(name="Recently Expired", value="\n".join(lines), inline=False)
+    return embed
+
+
+def build_countdown_complete_embed(record: dict) -> discord.Embed:
+    code = record.get("code", "unknown")
+    embed = discord.Embed(title="Vanity Countdown Complete", color=discord.Color.red())
+    embed.add_field(name="Vanity", value=f"`discord.gg/{code}`", inline=False)
+    embed.add_field(name="Started", value=discord_relative(record.get("taken_at")), inline=False)
+    embed.add_field(name="Timer Expired", value=discord_relative(record.get("expired_at") or record.get("expires_at")), inline=False)
+    embed.add_field(name="Moved To", value="Expired countdown list", inline=False)
+    embed.set_footer(text="30 days elapsed since the bot detected not-taken/available → taken/on-server.")
+    return embed
+
+
+def move_due_countdowns_to_expired(*, source: str = "loop", alert_sent_default: bool = False, alert_skipped_reason: Optional[str] = None) -> list[dict]:
+    now_dt = datetime.now(timezone.utc)
+    moved = []
+    for code, record in list(active_invalid_vanities.items()):
+        expires_dt = parse_iso_dt(record.get("expires_at"))
+        if not expires_dt or expires_dt > now_dt:
+            continue
+
+        active_invalid_vanities.pop(code, None)
+        expired_record = dict(record)
+        expired_record["expired_at"] = expires_dt.isoformat()
+        expired_record["moved_at"] = now_iso()
+        expired_record["moved_by"] = source
+        expired_record["alert_sent"] = bool(alert_sent_default)
+        expired_record["alert_sent_at"] = now_iso() if alert_sent_default else None
+        if alert_skipped_reason:
+            expired_record["alert_skipped_reason"] = alert_skipped_reason
+        expired_invalid_vanities[code] = expired_record
+        moved.append(expired_record)
+
+    if moved:
+        save_invalid_tracker()
+    return moved
+
+# =========================
 # DISCORD HELPERS
 # =========================
 
@@ -312,6 +632,44 @@ def make_txt_file(list_name: str, label: str, words: list[str]) -> Optional[disc
     with open(file_path, "w", encoding="utf-8") as f:
         f.write(", ".join(words))
     return discord.File(str(file_path), filename=file_path.name)
+
+
+async def send_countdown_complete_alert(record: dict) -> bool:
+    channel_id = config.get("invalid_alert_channel_id")
+    channel = await get_channel(channel_id) if channel_id else None
+    if not channel:
+        logger.warning("Countdown completed for %s but invalid_alert_channel_id is not set or could not be fetched.", record.get("code"))
+        return False
+
+    embed = build_countdown_complete_embed(record)
+    sent = await safe_send(channel, content="@everyone", embed=embed)
+    return sent is not None
+
+
+async def process_due_countdowns(source: str = "loop") -> list[dict]:
+    moved = move_due_countdowns_to_expired(source=source, alert_sent_default=False)
+    if not moved:
+        return []
+
+    changed = False
+    for record in moved:
+        sent = await send_countdown_complete_alert(record)
+        code = record.get("code")
+        if code not in expired_invalid_vanities:
+            continue
+
+        if sent:
+            expired_invalid_vanities[code]["alert_sent"] = True
+            expired_invalid_vanities[code]["alert_sent_at"] = now_iso()
+            expired_invalid_vanities[code]["alert_channel_id"] = config.get("invalid_alert_channel_id")
+        else:
+            expired_invalid_vanities[code]["alert_sent"] = False
+            expired_invalid_vanities[code]["alert_skipped_reason"] = "Alert channel missing or send failed."
+        changed = True
+
+    if changed:
+        save_invalid_tracker()
+    return moved
 
 # =========================
 # INVITE CHECKING
@@ -529,6 +887,14 @@ async def run_list_check(list_name: str, list_data: dict, manual_ctx=None):
                         added_count += 1
                         await safe_send(log_channel, f"`discord.gg/{code}` is not taken/available and was added to the not-taken TXT file.")
 
+                    # If it becomes available again, remove it from active/expired countdown tracking.
+                    removed_active, removed_expired = remove_invalid_vanity(code, reason="became_available", seen_at=now_iso(), save=True)
+                    if removed_active or removed_expired:
+                        await safe_send(
+                            log_channel,
+                            f"`discord.gg/{code}` became not taken/available again and was removed from the countdown tracker."
+                        )
+
                     await safe_send(available_channel, f"discord.gg/{code}")
 
                 elif result == "taken":
@@ -537,8 +903,15 @@ async def run_list_check(list_name: str, list_data: dict, manual_ctx=None):
                     taken_found.append(code)
 
                     if remove_unavailable(code):
+                        # This is the exact transition you requested: not taken/available -> taken/on server.
                         removed_count += 1
+                        transition_time = now_iso()
+                        record = add_invalid_vanity(code, list_name, taken_at=transition_time, source="checker")
                         await safe_send(log_channel, f"`discord.gg/{code}` is taken/on a server and was removed from the not-taken TXT file.")
+                        await safe_send(
+                            log_channel,
+                            f"Started 30-day countdown for `discord.gg/{code}`. Ends {discord_relative(record.get('expires_at'))}."
+                        )
 
                     await safe_send(taken_channel, f"discord.gg/{code}")
                     await safe_send(log_channel, f"{length} letters | Taken/on server: `discord.gg/{code}`")
@@ -661,6 +1034,11 @@ async def auto_check_loop():
     if not check_state["running"]:
         await run_all_checks()
 
+
+@tasks.loop(minutes=1)
+async def invalid_countdown_loop():
+    await process_due_countdowns(source="loop")
+
 # =========================
 # COMMANDS
 # =========================
@@ -695,8 +1073,22 @@ async def help_command(ctx):
     )
     embed.add_field(name="Checks", value=f"`{p}checklist <name>`\n`{p}checkall`\n`{p}stop`", inline=False)
     embed.add_field(name="Auto Checks", value=f"`{p}autocheck <minutes>`\n`{p}autostop`\n`{p}autostatus`", inline=False)
+    embed.add_field(
+        name="30-Day Taken Countdown Tracker",
+        value=(
+            f"`{p}setalertchannel #channel` - choose where @everyone completion alerts go\n"
+            f"`{p}invalid` - show active countdowns\n"
+            f"`{p}invalid <vanity>` or `{p}countdown <vanity>` - check one countdown\n"
+            f"`{p}invalidrecent [limit]` - recent active countdowns\n"
+            f"`{p}invalidexpired [limit]` - expired countdown list\n"
+            f"`{p}invalidcount` - active/expired totals\n"
+            f"`{p}invalidexport` - export tracker JSON\n"
+            f"`{p}backfillinvalid [messages_per_log_channel]` - rebuild old countdowns from log messages"
+        ),
+        inline=False
+    )
     embed.add_field(name="Settings", value=f"`{p}setprefix <prefix>`\n`{p}ratelimit <delay_seconds> <batch_size> <batch_cooldown_seconds> <list_cooldown_seconds>`", inline=False)
-    embed.add_field(name="Taken Files", value=f"`{p}unavailablecount <length>`\n`{p}getunavailable <length>`\n`{p}clearunavailable [length]`", inline=False)
+    embed.add_field(name="Available TXT Files", value=f"`{p}unavailablecount <length>`\n`{p}getunavailable <length>`\n`{p}clearunavailable [length]`", inline=False)
     await ctx.send(embed=embed)
 
 
@@ -1013,13 +1405,251 @@ async def autostatus(ctx):
     )
 
 
-@bot.command(name="unavailablecount", aliases=["invalidcount"])
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setalertchannel(ctx, channel: discord.TextChannel):
+    """Choose where @everyone countdown-complete alerts go."""
+    config["invalid_alert_channel_id"] = channel.id
+    save_config()
+    await ctx.send(f"Countdown completion alerts will now go to {channel.mention} with `@everyone`.")
+
+
+@bot.command(name="invalid")
+async def invalid_command(ctx, vanity: str = None):
+    """Show active countdowns, or a specific vanity countdown."""
+    await process_due_countdowns(source="command")
+    if vanity is None:
+        await ctx.send(embed=build_active_list_embed(limit=10, recent=True))
+        return
+
+    code = clean_code(vanity)
+    if not code:
+        await ctx.send("Give me a valid vanity, like `example` or `discord.gg/example`.")
+        return
+
+    if code in active_invalid_vanities:
+        await ctx.send(embed=build_invalid_detail_embed(active_invalid_vanities[code], expired=False))
+        return
+
+    if code in expired_invalid_vanities:
+        await ctx.send(embed=build_invalid_detail_embed(expired_invalid_vanities[code], expired=True))
+        return
+
+    await ctx.send(f"`discord.gg/{code}` is not in the active or expired countdown tracker.")
+
+
+@bot.command(name="countdown")
+async def countdown_command(ctx, vanity: str):
+    await process_due_countdowns(source="command")
+    code = clean_code(vanity)
+    if not code:
+        await ctx.send("Give me a valid vanity, like `example` or `discord.gg/example`.")
+        return
+
+    if code in active_invalid_vanities:
+        await ctx.send(embed=build_invalid_detail_embed(active_invalid_vanities[code], expired=False))
+    elif code in expired_invalid_vanities:
+        await ctx.send(embed=build_invalid_detail_embed(expired_invalid_vanities[code], expired=True))
+    else:
+        await ctx.send(f"`discord.gg/{code}` is not in the countdown tracker.")
+
+
+@bot.command(name="invalidrecent")
+async def invalidrecent(ctx, limit: int = 10):
+    await process_due_countdowns(source="command")
+    await ctx.send(embed=build_active_list_embed(limit=limit, recent=True))
+
+
+@bot.command(name="invalidexpiring")
+async def invalidexpiring(ctx, limit: int = 10):
+    await process_due_countdowns(source="command")
+    await ctx.send(embed=build_active_list_embed(limit=limit, recent=False))
+
+
+@bot.command(name="invalidexpired", aliases=["expiredinvalid"])
+async def invalidexpired(ctx, limit: int = 10):
+    await ctx.send(embed=build_expired_list_embed(limit=limit))
+
+
+@bot.command(name="invalidcount")
+async def invalidcount_command(ctx):
+    await process_due_countdowns(source="command")
+    expiring_today = 0
+    expiring_week = 0
+    now_dt = datetime.now(timezone.utc)
+    for record in active_invalid_vanities.values():
+        expires_dt = parse_iso_dt(record.get("expires_at"))
+        if not expires_dt:
+            continue
+        delta = expires_dt - now_dt
+        if timedelta(seconds=0) <= delta <= timedelta(days=1):
+            expiring_today += 1
+        if timedelta(seconds=0) <= delta <= timedelta(days=7):
+            expiring_week += 1
+
+    alert_channel_id = config.get("invalid_alert_channel_id")
+    embed = discord.Embed(title="Vanity Countdown Counts", color=discord.Color.blurple())
+    embed.add_field(name="Active Countdowns", value=str(len(active_invalid_vanities)), inline=True)
+    embed.add_field(name="Expired List", value=str(len(expired_invalid_vanities)), inline=True)
+    embed.add_field(name="Expiring Today", value=str(expiring_today), inline=True)
+    embed.add_field(name="Expiring This Week", value=str(expiring_week), inline=True)
+    embed.add_field(name="Alert Channel", value=f"<#{alert_channel_id}>" if alert_channel_id else "Not set", inline=False)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="invalidexport")
+async def invalidexport(ctx):
+    export_path = DATA_DIR / "invalid_tracker_export.json"
+    export = {
+        "exported_at": now_iso(),
+        "active_countdowns": active_invalid_vanities,
+        "expired_countdowns": expired_invalid_vanities,
+    }
+    write_json_file(export_path, export)
+    await ctx.send(
+        content=f"Exported `{len(active_invalid_vanities)}` active countdown(s) and `{len(expired_invalid_vanities)}` expired countdown(s).",
+        file=discord.File(str(export_path), filename=export_path.name),
+    )
+
+
+@bot.command(name="backfillinvalid")
+@commands.has_permissions(administrator=True)
+async def backfillinvalid(ctx, limit_per_log_channel: int = 5000):
+    """Rebuild countdowns from old transition messages in configured log channels."""
+    if limit_per_log_channel < 1:
+        await ctx.send("Use a message limit of at least `1`.")
+        return
+    if limit_per_log_channel > 50000:
+        await ctx.send("Use `50000` or less per log channel so Discord does not throttle the bot too hard.")
+        return
+
+    load_unavailable_cache()
+    status_msg = await ctx.send(f"Backfilling countdowns from log channels... scanning up to `{limit_per_log_channel}` messages per log channel.")
+
+    log_channel_ids = set()
+    channel_to_lists = defaultdict(list)
+    for list_name, raw_data in config.get("lists", {}).items():
+        data = normalize_list_record(raw_data)
+        cid = data.get("log_channel_id")
+        if cid:
+            try:
+                cid_int = int(cid)
+                log_channel_ids.add(cid_int)
+                channel_to_lists[cid_int].append(list_name)
+            except Exception:
+                pass
+
+    if not log_channel_ids:
+        await status_msg.edit(content="No log channels found in saved lists. Set list channels first, then run backfill again.")
+        return
+
+    timeline = []
+    scanned = 0
+    matched_taken = 0
+    matched_available = 0
+    failed_channels = []
+
+    for channel_id in log_channel_ids:
+        channel = await get_channel(channel_id)
+        if not channel:
+            failed_channels.append(str(channel_id))
+            continue
+        try:
+            async for message in channel.history(limit=limit_per_log_channel, oldest_first=True):
+                scanned += 1
+                content = message.content or ""
+                list_label = ",".join(channel_to_lists.get(channel_id, [])) or f"log:{channel_id}"
+
+                for match in AVAILABLE_TRANSITION_RE.finditer(content):
+                    code = clean_code(match.group(1))
+                    if code:
+                        matched_available += 1
+                        timeline.append((message.created_at.astimezone(timezone.utc), "available", code, list_label))
+
+                for match in TAKEN_TRANSITION_RE.finditer(content):
+                    code = clean_code(match.group(1))
+                    if code:
+                        matched_taken += 1
+                        timeline.append((message.created_at.astimezone(timezone.utc), "taken", code, list_label))
+        except discord.Forbidden:
+            failed_channels.append(f"{channel_id} (missing Read Message History permission)")
+        except Exception as e:
+            failed_channels.append(f"{channel_id} ({short_text(e, 80)})")
+
+    timeline.sort(key=lambda item: item[0])
+    reconstructed = {}
+    for event_dt, event_type, code, list_label in timeline:
+        if event_type == "available":
+            reconstructed.pop(code, None)
+        elif event_type == "taken":
+            reconstructed[code] = make_tracker_record(code, list_label, taken_at=event_dt.isoformat(), source="backfill")
+
+    added_active = 0
+    updated_active = 0
+    moved_expired = 0
+    skipped_currently_available = 0
+    now_dt = datetime.now(timezone.utc)
+
+    for code, record in reconstructed.items():
+        length = len(code)
+        if length in TRACKED_LENGTHS and code in unavailable_cache[length]:
+            # The current TXT files say this is available/not-taken, so do not resurrect an old countdown.
+            active_invalid_vanities.pop(code, None)
+            expired_invalid_vanities.pop(code, None)
+            skipped_currently_available += 1
+            continue
+
+        expires_dt = parse_iso_dt(record.get("expires_at"))
+        if expires_dt and expires_dt <= now_dt:
+            active_invalid_vanities.pop(code, None)
+            expired_record = dict(record)
+            expired_record["expired_at"] = expires_dt.isoformat()
+            expired_record["moved_at"] = now_iso()
+            expired_record["moved_by"] = "backfill"
+            expired_record["alert_sent"] = False
+            expired_record["alert_sent_at"] = None
+            expired_record["alert_skipped_reason"] = "Backfilled after the timer had already expired; not auto-pinged to avoid spam."
+            expired_invalid_vanities[code] = expired_record
+            moved_expired += 1
+            continue
+
+        expired_invalid_vanities.pop(code, None)
+        existing = active_invalid_vanities.get(code)
+        if existing:
+            existing_dt = parse_iso_dt(existing.get("taken_at"))
+            record_dt = parse_iso_dt(record.get("taken_at"))
+            if record_dt and (not existing_dt or record_dt < existing_dt):
+                active_invalid_vanities[code] = record
+                updated_active += 1
+        else:
+            active_invalid_vanities[code] = record
+            added_active += 1
+
+    save_invalid_tracker()
+
+    embed = discord.Embed(title="Backfill Complete", color=discord.Color.green())
+    embed.add_field(name="Messages Scanned", value=str(scanned), inline=True)
+    embed.add_field(name="Taken Transitions Found", value=str(matched_taken), inline=True)
+    embed.add_field(name="Available Transitions Found", value=str(matched_available), inline=True)
+    embed.add_field(name="Active Added", value=str(added_active), inline=True)
+    embed.add_field(name="Active Updated Earlier", value=str(updated_active), inline=True)
+    embed.add_field(name="Moved To Expired", value=str(moved_expired), inline=True)
+    embed.add_field(name="Skipped Currently Available", value=str(skipped_currently_available), inline=True)
+    embed.add_field(name="Active Total", value=str(len(active_invalid_vanities)), inline=True)
+    embed.add_field(name="Expired Total", value=str(len(expired_invalid_vanities)), inline=True)
+    if failed_channels:
+        embed.add_field(name="Skipped Channels", value="\n".join(failed_channels[:8]), inline=False)
+    embed.set_footer(text="Backfilled expired timers are saved, but not @everyone pinged to avoid old-alert spam.")
+    await status_msg.edit(content=None, embed=embed)
+
+
+@bot.command(name="unavailablecount")
 async def unavailablecount(ctx, length: int):
     if length < 1 or length > 32:
         await ctx.send("Use a length between 1 and 32.")
         return
     load_unavailable_cache()
-    await ctx.send(f"{length}-letter taken/on-server count: `{len(unavailable_cache[length])}`")
+    await ctx.send(f"{length}-letter not-taken/available TXT count: `{len(unavailable_cache[length])}`")
 
 
 @bot.command(name="getunavailable", aliases=["getinvalid"])
@@ -1030,7 +1660,7 @@ async def getunavailable(ctx, length: int):
     load_unavailable_cache()
     rewrite_unavailable_file(length)
     path = unavailable_file(length)
-    await ctx.send(content=f"Taken/on-server file for `{length}` letters:", file=discord.File(str(path), filename=path.name))
+    await ctx.send(content=f"Not-taken/available TXT file for `{length}` letters:", file=discord.File(str(path), filename=path.name))
 
 
 @bot.command(name="clearunavailable", aliases=["clearinvalid"])
@@ -1041,14 +1671,14 @@ async def clearunavailable(ctx, length: int = None):
         for l in TRACKED_LENGTHS:
             unavailable_cache[l].clear()
             rewrite_unavailable_file(l)
-        await ctx.send("Cleared all taken/on-server files.")
+        await ctx.send("Cleared all not-taken/available TXT files.")
         return
     if length < 1 or length > 32:
         await ctx.send("Use a length between 1 and 32.")
         return
     unavailable_cache[length].clear()
     rewrite_unavailable_file(length)
-    await ctx.send(f"Cleared taken/on-server file for `{length}` letters.")
+    await ctx.send(f"Cleared not-taken/available TXT file for `{length}` letters.")
 
 
 @bot.command()
@@ -1090,9 +1720,14 @@ async def on_ready():
     ensure_unavailable_files()
     load_config()
     load_unavailable_cache()
+    load_invalid_tracker()
 
     if not auto_check_loop.is_running():
         auto_check_loop.start()
+    if not invalid_countdown_loop.is_running():
+        invalid_countdown_loop.start()
+
+    await process_due_countdowns(source="startup")
 
     logger.info("Logged in as %s | Prefix: %s", bot.user, config.get("prefix", DEFAULT_PREFIX))
 
