@@ -928,6 +928,58 @@ def build_active_list_embed(limit: int = 10, *, recent: bool = True) -> discord.
     return embed
 
 
+
+
+def split_embed_lines(lines: list[str], max_chars: int = 1000) -> list[str]:
+    chunks = []
+    current = []
+    current_len = 0
+    for line in lines:
+        line_len = len(line) + 1
+        if current and current_len + line_len > max_chars:
+            chunks.append("\n".join(current))
+            current = []
+            current_len = 0
+        current.append(line)
+        current_len += line_len
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
+def build_top_shortest_countdowns_embed(limit: int = 50) -> discord.Embed:
+    limit = max(1, min(int(limit), 50))
+    records = active_sorted_expiring()[:limit]
+    embed = discord.Embed(
+        title=f"Top {limit} Shortest Vanity Countdowns",
+        description="Active countdowns sorted by the least time remaining.",
+        color=discord.Color.orange(),
+    )
+    embed.add_field(name="Active Countdowns", value=str(len(active_invalid_vanities)), inline=True)
+    embed.add_field(name="Showing", value=str(len(records)), inline=True)
+    alert_channel_id = config.get("invalid_alert_channel_id")
+    embed.add_field(name="Alert Channel", value=f"<#{alert_channel_id}>" if alert_channel_id else "Not set", inline=True)
+
+    if not records:
+        embed.add_field(name="No Active Countdowns", value="No vanities are currently in the active countdown tracker.", inline=False)
+        return embed
+
+    lines = []
+    for idx, record in enumerate(records, start=1):
+        code = record.get("code", "unknown")
+        expires_dt = parse_iso_dt(record.get("expires_at"))
+        expires_unix = int(expires_dt.timestamp()) if expires_dt else 0
+        remaining = format_duration(seconds_until(record.get("expires_at")))
+        lines.append(f"`{idx}.` `discord.gg/{code}` — `{remaining}` left • <t:{expires_unix}:R>")
+
+    for chunk_index, chunk in enumerate(split_embed_lines(lines), start=1):
+        name = "Shortest Countdowns" if chunk_index == 1 else f"Shortest Countdowns Continued {chunk_index}"
+        embed.add_field(name=name, value=chunk, inline=False)
+
+    embed.set_footer(text=f"Use {config.get('prefix', DEFAULT_PREFIX)}countdown <vanity> for exact details. Max shown: 50.")
+    return embed
+
+
 def build_expired_list_embed(limit: int = 10) -> discord.Embed:
     limit = max(1, min(int(limit), 25))
     records = expired_sorted_recent()[:limit]
@@ -1522,6 +1574,7 @@ async def help_command(ctx):
             f"`{p}invalid` - show active countdowns\n"
             f"`{p}invalid <vanity>` or `{p}countdown <vanity>` - check one countdown\n"
             f"`{p}invalidrecent [limit]` - recent active countdowns\n"
+            f"`{p}topcountdowns [limit]` - top 50 shortest countdowns\n"
             f"`{p}invalidexpired [limit]` - expired countdown list\n"
             f"`{p}invalidcount` - active/expired totals\n"
             f"`{p}invalidexport` - export tracker JSON\n"
@@ -1910,6 +1963,13 @@ async def invalidrecent(ctx, limit: int = 10):
 async def invalidexpiring(ctx, limit: int = 10):
     await process_due_countdowns(source="command")
     await ctx.send(embed=build_active_list_embed(limit=limit, recent=False))
+
+
+@bot.command(name="topcountdowns", aliases=["shortestcountdowns", "invalidtop", "topinvalid", "soonestcountdowns"])
+async def topcountdowns(ctx, limit: int = 50):
+    """Show up to 50 active countdowns with the shortest time remaining."""
+    await process_due_countdowns(source="command")
+    await ctx.send(embed=build_top_shortest_countdowns_embed(limit=limit))
 
 
 @bot.command(name="invalidexpired", aliases=["expiredinvalid"])
