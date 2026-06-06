@@ -73,9 +73,17 @@ EXPIRED_INVALID_FILE = DATA_DIR / "expired_invalid_vanities.json"
 BACKFILL_STATE_FILE = DATA_DIR / "backfill_scan_state.json"
 BACKFILL_EVENTS_FILE = DATA_DIR / "backfill_transition_events.json"
 VANITY_STATUS_FILE = DATA_DIR / "vanity_statuses.json"
+RUNTIME_STATE_FILE = DATA_DIR / "runtime_state.json"
 EVENT_LOG_FILE = DATA_DIR / "bot_events.log"
 BACKUP_DIR = DATA_DIR / "backups"
 COUNTDOWN_DAYS = 30
+DEFAULT_ALERT_STAGES_SECONDS = [7 * 86400, 24 * 3600, 6 * 3600, 3600]
+ALERT_STAGE_LABELS = {
+    7 * 86400: "7 days left",
+    24 * 3600: "24 hours left",
+    6 * 3600: "6 hours left",
+    3600: "1 hour left",
+}
 TRACKED_LENGTHS = range(1, 33)
 
 logging.basicConfig(
@@ -97,12 +105,16 @@ config = {
     "batch_cooldown_seconds": DEFAULT_BATCH_COOLDOWN_SECONDS,
     "list_cooldown_seconds": DEFAULT_LIST_COOLDOWN_SECONDS,
     "invalid_alert_channel_id": None,
+    "alert_stages_enabled": True,
+    "countdown_alert_stages_seconds": DEFAULT_ALERT_STAGES_SECONDS.copy(),
     # Countdown filters. Use !setcountdownlengths to change these.
     # This prevents bad backfill data like discord.gg/a from polluting the tracker.
     "min_countdown_length": int(os.getenv("MIN_COUNTDOWN_LENGTH", "2")),
     "max_countdown_length": int(os.getenv("MAX_COUNTDOWN_LENGTH", "32")),
     # When true, !topcountdowns verifies candidates against Discord before showing them.
     "topcountdowns_live_verify": True,
+    # Saves and resumes interrupted manual checks/backfills after restarts/redeploys.
+    "auto_resume_running_jobs": True,
     "lists": {}
 }
 
@@ -140,6 +152,17 @@ check_state = {
     "current": 0,
     "total": 0,
     "mode": None,
+}
+
+# Persistent runtime state. This lets the bot remember that a manual
+# check/backfill was running before a restart/redeploy, then restart it safely
+# after reconnecting. It does not create fake countdowns because countdown
+# creation still depends on persistent vanity_statuses and transition logic.
+runtime_state: dict[str, dict] = {
+    "active_job": None,
+    "last_shutdown_at": None,
+    "last_startup_at": None,
+    "resume_history": [],
 }
 
 # =========================
@@ -253,6 +276,7 @@ def save_all_data(reason: str = "manual") -> None:
         save_invalid_tracker()
         save_backfill_progress()
         save_vanity_statuses()
+        save_runtime_state()
         for length in TRACKED_LENGTHS:
             rewrite_unavailable_file(length)
         write_event_log("all_data_saved", {
@@ -264,6 +288,189 @@ def save_all_data(reason: str = "manual") -> None:
         })
     except Exception as e:
         logger.warning("save_all_data failed: %s", e)
+
+
+
+def load_runtime_state() -> None:
+    """Load persistent runtime state for interrupted jobs."""
+    ensure_dirs()
+    runtime_state.clear()
+    runtime_state.update({
+        "active_job": None,
+        "last_shutdown_at": None,
+        "last_startup_at": None,
+        "resume_history": [],
+    })
+    if not RUNTIME_STATE_FILE.exists():
+        save_runtime_state()
+        return
+    try:
+        with open(RUNTIME_STATE_FILE, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            runtime_state.update(loaded)
+        if not isinstance(runtime_state.get("resume_history"), list):
+            runtime_state["resume_history"] = []
+    except Exception as e:
+        logger.warning("Runtime state failed to load: %s", e)
+        write_event_log("runtime_state_load_failed", {"error": short_text(e, 200)})
+
+
+def save_runtime_state() -> None:
+    try:
+        atomic_write_json(RUNTIME_STATE_FILE, runtime_state, label="runtime_state", backup=True)
+    except Exception as e:
+        logger.warning("Runtime state save failed: %s", e)
+
+
+def active_runtime_job() -> Optional[dict]:
+    job = runtime_state.get("active_job")
+    return job if isinstance(job, dict) else None
+
+
+def set_runtime_job(job_type: str, **payload) -> dict:
+    """Persist a job that should resume if the bot restarts mid-run."""
+    job = {
+        "id": f"{job_type}:{int(datetime.now(timezone.utc).timestamp())}",
+        "type": job_type,
+        "status": "running",
+        "started_at": now_iso(),
+        "updated_at": now_iso(),
+        "progress": {},
+        **payload,
+    }
+    runtime_state["active_job"] = job
+    save_runtime_state()
+    write_event_log("runtime_job_started", job)
+    return job
+
+
+def update_runtime_job(**payload) -> None:
+    job = active_runtime_job()
+    if not job:
+        return
+    job.update(payload)
+    job["updated_at"] = now_iso()
+    save_runtime_state()
+
+
+def update_runtime_progress(**progress) -> None:
+    job = active_runtime_job()
+    if not job:
+        return
+    current_progress = job.get("progress") if isinstance(job.get("progress"), dict) else {}
+    current_progress.update(progress)
+    job["progress"] = current_progress
+    job["updated_at"] = now_iso()
+    # Progress saves are intentionally lightweight but still atomic. This lets
+    # the bot show where it was when a restart happened.
+    save_runtime_state()
+
+
+def clear_runtime_job(reason: str = "completed") -> None:
+    job = active_runtime_job()
+    if job:
+        history = runtime_state.get("resume_history") if isinstance(runtime_state.get("resume_history"), list) else []
+        finished = dict(job)
+        finished["finished_at"] = now_iso()
+        finished["finish_reason"] = reason
+        history.insert(0, finished)
+        runtime_state["resume_history"] = history[:25]
+        write_event_log("runtime_job_cleared", {"reason": reason, "job": job})
+    runtime_state["active_job"] = None
+    save_runtime_state()
+
+
+def describe_runtime_job(job: Optional[dict] = None) -> str:
+    job = job or active_runtime_job()
+    if not job:
+        return "No active saved runtime job."
+    progress = job.get("progress") if isinstance(job.get("progress"), dict) else {}
+    parts = [
+        f"Type: `{job.get('type', 'unknown')}`",
+        f"Status: `{job.get('status', 'unknown')}`",
+        f"Started: {format_time(job.get('started_at'))}",
+        f"Updated: {format_time(job.get('updated_at'))}",
+    ]
+    if job.get("list_name"):
+        parts.append(f"List: `{job.get('list_name')}`")
+    if job.get("channel_id"):
+        parts.append(f"Channel: <#{job.get('channel_id')}>")
+    if progress:
+        current = progress.get("current")
+        total = progress.get("total")
+        if current is not None and total is not None:
+            parts.append(f"Progress: `{current}/{total}`")
+        if progress.get("current_code"):
+            parts.append(f"Current code: `discord.gg/{progress.get('current_code')}`")
+    return "\n".join(parts)
+
+
+async def resume_saved_runtime_job() -> None:
+    """Restart interrupted manual checks/backfills after the bot reconnects."""
+    await bot.wait_until_ready()
+    # Give Discord cache/channel fetches a moment after ready.
+    await asyncio.sleep(8)
+    if check_state.get("running"):
+        return
+    if not config.get("auto_resume_running_jobs", True):
+        write_event_log("runtime_resume_skipped", {"reason": "auto_resume_disabled"})
+        return
+
+    job = active_runtime_job()
+    if not job or job.get("status") not in {"running", "resuming"}:
+        return
+
+    job_type = job.get("type")
+    update_runtime_job(status="resuming", resumed_at=now_iso())
+    write_event_log("runtime_job_resuming", job)
+
+    try:
+        if job_type == "checklist":
+            list_name = clean_code(job.get("list_name"))
+            if not list_name or list_name not in config.get("lists", {}):
+                clear_runtime_job("resume_failed_missing_list")
+                return
+            await run_list_check(list_name, config["lists"][list_name], manual_ctx=None)
+            clear_runtime_job("resumed_checklist_completed")
+        elif job_type == "checkall":
+            await run_all_checks(manual_ctx=None)
+            clear_runtime_job("resumed_checkall_completed")
+        elif job_type == "backfillchannel":
+            channel_id = job.get("channel_id")
+            limit = int(job.get("limit_per_channel", 5000))
+            channel = await get_channel(channel_id)
+            if not channel:
+                clear_runtime_job("resume_failed_missing_channel")
+                return
+            await rebuild_countdowns_from_messages([channel], limit, list_label=f"resumed:{getattr(channel, 'name', channel_id)}")
+            clear_runtime_job("resumed_backfill_completed")
+        elif job_type == "backfillinvalid":
+            limit = int(job.get("limit_per_log_channel", 5000))
+            log_channels = []
+            seen_channel_ids = set()
+            for list_name, raw_data in config.get("lists", {}).items():
+                data = normalize_list_record(raw_data)
+                cid = data.get("log_channel_id")
+                try:
+                    cid_int = int(cid)
+                except Exception:
+                    continue
+                if cid_int in seen_channel_ids:
+                    continue
+                channel = await get_channel(cid_int)
+                if channel:
+                    log_channels.append(channel)
+                    seen_channel_ids.add(cid_int)
+            if log_channels:
+                await rebuild_countdowns_from_messages(log_channels, limit, list_label="resumed-saved-log")
+            clear_runtime_job("resumed_backfillinvalid_completed")
+        else:
+            clear_runtime_job("resume_skipped_unknown_job_type")
+    except Exception as e:
+        logger.exception("Failed to resume runtime job: %s", e)
+        update_runtime_job(status="failed", error=short_text(e, 500), failed_at=now_iso())
+        write_event_log("runtime_job_resume_failed", {"error": short_text(e, 500), "job": job})
 
 
 def normalize_list_record(data: dict) -> dict:
@@ -334,6 +541,13 @@ def load_config() -> None:
     config["batch_cooldown_seconds"] = int(loaded.get("batch_cooldown_seconds", DEFAULT_BATCH_COOLDOWN_SECONDS))
     config["list_cooldown_seconds"] = int(loaded.get("list_cooldown_seconds", DEFAULT_LIST_COOLDOWN_SECONDS))
     config["invalid_alert_channel_id"] = loaded.get("invalid_alert_channel_id")
+    config["alert_stages_enabled"] = bool(loaded.get("alert_stages_enabled", True))
+    raw_stages = loaded.get("countdown_alert_stages_seconds", DEFAULT_ALERT_STAGES_SECONDS)
+    try:
+        parsed_stages = sorted({int(x) for x in raw_stages if int(x) > 0}, reverse=True)
+        config["countdown_alert_stages_seconds"] = parsed_stages or DEFAULT_ALERT_STAGES_SECONDS.copy()
+    except Exception:
+        config["countdown_alert_stages_seconds"] = DEFAULT_ALERT_STAGES_SECONDS.copy()
     try:
         config["min_countdown_length"] = max(1, min(32, int(loaded.get("min_countdown_length", config.get("min_countdown_length", 2)))))
     except Exception:
@@ -343,6 +557,7 @@ def load_config() -> None:
     except Exception:
         config["max_countdown_length"] = 32
     config["topcountdowns_live_verify"] = bool(loaded.get("topcountdowns_live_verify", config.get("topcountdowns_live_verify", True)))
+    config["auto_resume_running_jobs"] = bool(loaded.get("auto_resume_running_jobs", config.get("auto_resume_running_jobs", True)))
 
     loaded_lists = loaded.get("lists", {}) if isinstance(loaded.get("lists", {}), dict) else {}
     config["lists"] = {clean_code(name): normalize_list_record(data) for name, data in loaded_lists.items() if clean_code(name)}
@@ -396,6 +611,85 @@ def countdown_filter_label() -> str:
     if min_len == max_len:
         return f"{min_len} chars only"
     return f"{min_len}-{max_len} chars"
+
+
+
+def configured_alert_stages() -> list[int]:
+    """Return enabled alert stages in seconds, largest to smallest."""
+    raw = config.get("countdown_alert_stages_seconds", DEFAULT_ALERT_STAGES_SECONDS)
+    stages = []
+    for item in raw:
+        try:
+            value = int(item)
+        except Exception:
+            continue
+        if value > 0 and value not in stages:
+            stages.append(value)
+    return sorted(stages or DEFAULT_ALERT_STAGES_SECONDS.copy(), reverse=True)
+
+
+def stage_label(seconds: int) -> str:
+    seconds = int(seconds)
+    if seconds in ALERT_STAGE_LABELS:
+        return ALERT_STAGE_LABELS[seconds]
+    if seconds % 86400 == 0:
+        days = seconds // 86400
+        return f"{days} day{'s' if days != 1 else ''} left"
+    if seconds % 3600 == 0:
+        hours = seconds // 3600
+        return f"{hours} hour{'s' if hours != 1 else ''} left"
+    if seconds % 60 == 0:
+        minutes = seconds // 60
+        return f"{minutes} minute{'s' if minutes != 1 else ''} left"
+    return f"{seconds} seconds left"
+
+
+def stage_key(seconds: int) -> str:
+    return str(int(seconds))
+
+
+def source_confidence(source: Optional[str]) -> tuple[str, str]:
+    """Human-readable confidence for countdown timestamps."""
+    src = str(source or "").lower()
+    if any(token in src for token in ["checker", "live", "manual_live"]):
+        return "High", "Source: live checker transition"
+    if "backfill" in src or "discord_log" in src or "log" in src:
+        return "Medium", "Source: Discord log timestamp"
+    if "manual" in src:
+        return "Low", "Source: manual entry"
+    return "Medium", f"Source: {source or 'tracker'}"
+
+
+def apply_confidence_fields(record: dict) -> None:
+    confidence, reason = source_confidence(record.get("source"))
+    record.setdefault("confidence", confidence)
+    record.setdefault("confidence_note", reason)
+
+
+def initialize_stage_alerts(record: dict, *, skip_already_passed: bool = False) -> None:
+    """Make sure a record has a stage alert tracker.
+
+    Backfilled timers can already be deep into the 30-day window. To avoid a
+    mass ping when rebuilding old data, already-passed stages are marked as
+    skipped at creation time. Future stages still alert normally.
+    """
+    sent = record.get("stage_alerts")
+    if not isinstance(sent, dict):
+        sent = {}
+    expires_dt = parse_iso_dt(record.get("expires_at"))
+    now_dt = datetime.now(timezone.utc)
+    remaining = int((expires_dt - now_dt).total_seconds()) if expires_dt else 0
+    if skip_already_passed:
+        for seconds in configured_alert_stages():
+            key = stage_key(seconds)
+            if remaining <= seconds and key not in sent:
+                sent[key] = {
+                    "sent": False,
+                    "skipped": True,
+                    "skipped_at": now_iso(),
+                    "reason": "Backfilled after this alert stage had already passed; skipped to avoid mass pings.",
+                }
+    record["stage_alerts"] = sent
 
 
 def prune_countdown_tracker_by_length(*, save: bool = True) -> dict:
@@ -562,6 +856,8 @@ def normalize_tracker_record(code: str, record: dict, *, expired: bool = False) 
     output.setdefault("source", "tracker")
     output.setdefault("created_at", output["taken_at"])
     output.setdefault("updated_at", now_iso())
+    apply_confidence_fields(output)
+    initialize_stage_alerts(output, skip_already_passed=False)
 
     if expired:
         output.setdefault("expired_at", output["expires_at"])
@@ -1025,7 +1321,7 @@ def make_tracker_record(code: str, list_name: str, taken_at: Optional[str] = Non
     taken_dt = parse_iso_dt(taken_at) or datetime.now(timezone.utc)
     expires_dt = taken_dt + timedelta(days=COUNTDOWN_DAYS)
     timestamp = now_iso()
-    return {
+    record = {
         "code": code,
         "taken_at": taken_dt.isoformat(),
         "invalid_at": taken_dt.isoformat(),
@@ -1036,6 +1332,9 @@ def make_tracker_record(code: str, list_name: str, taken_at: Optional[str] = Non
         "created_at": timestamp,
         "updated_at": timestamp,
     }
+    apply_confidence_fields(record)
+    initialize_stage_alerts(record, skip_already_passed=("backfill" in str(source).lower() or "log" in str(source).lower()))
+    return record
 
 
 def add_invalid_vanity(code: str, list_name: str, taken_at: Optional[str] = None, source: str = "checker") -> dict:
@@ -1192,7 +1491,10 @@ def build_invalid_detail_embed(record: dict, *, expired: bool = False) -> discor
         embed.add_field(name="Live Countdown", value=f"`{format_duration(remaining)}` remaining • <t:{int(parse_iso_dt(record.get('expires_at')).timestamp())}:R>", inline=False)
     embed.add_field(name="List", value=f"`{record.get('list', 'unknown')}`", inline=True)
     embed.add_field(name="Length", value=f"`{record.get('length', len(code))}`", inline=True)
-    embed.set_footer(text="Countdowns are based on when this bot detected taken/on-server → not-taken/available.")
+    confidence = record.get("confidence") or source_confidence(record.get("source"))[0]
+    confidence_note = record.get("confidence_note") or source_confidence(record.get("source"))[1]
+    embed.add_field(name="Confidence", value=f"`{confidence}`\n{confidence_note}", inline=False)
+    embed.set_footer(text="Countdowns are based on the first not-taken log after the most recent taken run. Live detections are most accurate.")
     return embed
 
 
@@ -1283,7 +1585,9 @@ def build_top_shortest_countdowns_embeds(limit: int = 50, per_embed: int = 45) -
             remaining = format_duration(seconds_until(record.get("expires_at")))
             started_dt = parse_iso_dt(record.get("taken_at") or record.get("invalid_at"))
             started_unix = int(started_dt.timestamp()) if started_dt else 0
-            lines.append(f"`{idx}.` `discord.gg/{code}` — `{remaining}` left • ends <t:{expires_unix}:R> • since <t:{started_unix}:R>")
+            confidence = str(record.get("confidence") or source_confidence(record.get("source"))[0])
+            confidence_short = confidence[:1].upper() if confidence else "?"
+            lines.append(f"`{idx}.` `discord.gg/{code}` — `{remaining}` left • ends <t:{expires_unix}:R> • since <t:{started_unix}:R> • `{confidence_short}`")
 
         for chunk_index, chunk in enumerate(split_embed_lines(lines, max_chars=1000), start=1):
             name = "Shortest Countdowns" if chunk_index == 1 else f"Shortest Countdowns Continued {chunk_index}"
@@ -1331,7 +1635,10 @@ def build_countdown_complete_embed(record: dict) -> discord.Embed:
     embed.add_field(name="Not Taken Since", value=discord_relative(record.get("taken_at") or record.get("invalid_at")), inline=False)
     embed.add_field(name="Timer Expired", value=discord_relative(record.get("expired_at") or record.get("expires_at")), inline=False)
     embed.add_field(name="Moved To", value="Expired countdown list", inline=False)
-    embed.set_footer(text="30 days elapsed since the bot detected taken/on-server → not-taken/available.")
+    confidence = record.get("confidence") or source_confidence(record.get("source"))[0]
+    confidence_note = record.get("confidence_note") or source_confidence(record.get("source"))[1]
+    embed.add_field(name="Confidence", value=f"`{confidence}`\n{confidence_note}", inline=False)
+    embed.set_footer(text="30 days elapsed since the first confirmed not-taken log after the most recent taken run.")
     return embed
 
 
@@ -1517,6 +1824,108 @@ def make_txt_file(list_name: str, label: str, words: list[str]) -> Optional[disc
     with open(file_path, "w", encoding="utf-8") as f:
         f.write(", ".join(words))
     return discord.File(str(file_path), filename=file_path.name)
+
+
+def build_countdown_stage_embed(record: dict, stage_seconds: int) -> discord.Embed:
+    code = record.get("code", "unknown")
+    label = stage_label(stage_seconds)
+    embed = discord.Embed(title=f"Vanity Countdown Alert: {label}", color=discord.Color.gold())
+    embed.add_field(name="Vanity", value=f"`discord.gg/{code}`", inline=False)
+    embed.add_field(name="Stage", value=f"`{label}`", inline=True)
+    embed.add_field(name="Remaining", value=f"`{format_duration(seconds_until(record.get('expires_at')))}`", inline=True)
+    embed.add_field(name="Not Taken Since", value=discord_relative(record.get("taken_at") or record.get("invalid_at")), inline=False)
+    embed.add_field(name="Timer Ends", value=discord_relative(record.get("expires_at")), inline=False)
+    confidence = record.get("confidence") or source_confidence(record.get("source"))[0]
+    confidence_note = record.get("confidence_note") or source_confidence(record.get("source"))[1]
+    embed.add_field(name="Confidence", value=f"`{confidence}`\n{confidence_note}", inline=False)
+    embed.set_footer(text="Stage alerts fire once per countdown and are saved so restarts do not duplicate them.")
+    return embed
+
+
+async def send_countdown_stage_alert(record: dict, stage_seconds: int) -> bool:
+    channel_id = config.get("invalid_alert_channel_id")
+    channel = await get_channel(channel_id) if channel_id else None
+    if not channel:
+        logger.warning("Stage alert for %s was due but invalid_alert_channel_id is not set or could not be fetched.", record.get("code"))
+        return False
+    embed = build_countdown_stage_embed(record, stage_seconds)
+    sent = await safe_send(channel, content="@everyone", embed=embed)
+    return sent is not None
+
+
+async def process_stage_alerts(source: str = "loop", max_alerts: int = 25) -> dict:
+    """Send saved one-time alerts at 7d/24h/6h/1h remaining.
+
+    Stage alerts are only sent for records that are still active. Already-passed
+    stages on old backfilled records are marked skipped when the record is built,
+    which prevents mass pings after a clean rebuild.
+    """
+    if not config.get("alert_stages_enabled", True):
+        return {"sent": 0, "failed": 0, "skipped": 0}
+
+    sent_count = 0
+    failed_count = 0
+    skipped_count = 0
+    now_dt = datetime.now(timezone.utc)
+
+    for code, record in list(active_invalid_vanities.items()):
+        if sent_count >= max_alerts:
+            break
+        expires_dt = parse_iso_dt(record.get("expires_at"))
+        if not expires_dt:
+            continue
+        remaining = int((expires_dt - now_dt).total_seconds())
+        if remaining <= 0:
+            continue
+        initialize_stage_alerts(record, skip_already_passed=False)
+        stage_alerts = record.setdefault("stage_alerts", {})
+
+        for seconds in configured_alert_stages():
+            if sent_count >= max_alerts:
+                break
+            key = stage_key(seconds)
+            existing = stage_alerts.get(key)
+            if isinstance(existing, dict) and (existing.get("sent") or existing.get("skipped")):
+                continue
+            if remaining <= seconds:
+                ok = await send_countdown_stage_alert(record, seconds)
+                if ok:
+                    stage_alerts[key] = {
+                        "sent": True,
+                        "sent_at": now_iso(),
+                        "stage_seconds": seconds,
+                        "stage_label": stage_label(seconds),
+                        "source": source,
+                        "alert_channel_id": config.get("invalid_alert_channel_id"),
+                    }
+                    sent_count += 1
+                else:
+                    stage_alerts[key] = {
+                        "sent": False,
+                        "failed": True,
+                        "failed_at": now_iso(),
+                        "stage_seconds": seconds,
+                        "stage_label": stage_label(seconds),
+                        "source": source,
+                        "reason": "Alert channel missing or send failed.",
+                    }
+                    failed_count += 1
+                record["updated_at"] = now_iso()
+                # Send at most one stage per vanity per loop, even if multiple thresholds were crossed.
+                break
+            else:
+                skipped_count += 1
+
+    if sent_count or failed_count:
+        save_invalid_tracker()
+        write_event_log("countdown_stage_alerts_processed", {
+            "source": source,
+            "sent": sent_count,
+            "failed": failed_count,
+            "max_alerts": max_alerts,
+        })
+
+    return {"sent": sent_count, "failed": failed_count, "skipped": skipped_count}
 
 
 async def send_countdown_complete_alert(record: dict) -> bool:
@@ -1753,6 +2162,7 @@ async def run_list_check(list_name: str, list_data: dict, manual_ctx=None):
         async with aiohttp.ClientSession(timeout=timeout) as session:
             for index, code in enumerate(cleaned_codes, start=1):
                 check_state["current"] = index
+                update_runtime_progress(current=index, total=len(cleaned_codes), list_name=list_name, current_code=code)
 
                 if check_state["stop_requested"]:
                     break
@@ -1941,6 +2351,7 @@ async def auto_check_loop():
 
 @tasks.loop(minutes=1)
 async def invalid_countdown_loop():
+    await process_stage_alerts(source="loop")
     await process_due_countdowns(source="loop")
 
 
@@ -1981,7 +2392,11 @@ def build_help_page(page: int = 1) -> discord.Embed:
             f"`{p}addlist <name> <available_channel> <taken_channel> <log_channel> <summary_channel> <ping_role|none> <words>`\n"
             f"Example:\n`{p}addlist 4letters #available #taken #log #summary none love, hate, void, glow`"
         ), inline=False)
-        embed.add_field(name="Alert Channel", value=f"`{p}setalertchannel #channel` — choose where @everyone completion alerts go", inline=False)
+        embed.add_field(name="Alert Channel", value=(
+            f"`{p}setalertchannel #channel` — choose where @everyone completion and stage alerts go\n"
+            f"`{p}alertstages` — view alert stages\n"
+            f"`{p}setalertstages default|off|7d 24h 6h 1h`"
+        ), inline=False)
         embed.add_field(name="Persistence", value="For Railway, attach a Volume and set `DATA_DIR=/data` so lists/countdowns survive redeploys.", inline=False)
     elif page == 2:
         embed.add_field(name="Manage Lists", value=(
@@ -1995,7 +2410,7 @@ def build_help_page(page: int = 1) -> discord.Embed:
         embed.add_field(name="Auto Checks", value=f"`{p}autocheck <minutes>`\n`{p}autostop`\n`{p}autostatus`", inline=False)
         embed.add_field(name="Rate Settings", value=f"`{p}ratelimit <delay_seconds> <batch_size> <batch_cooldown_seconds> <list_cooldown_seconds>`", inline=False)
     elif page == 4:
-        embed.add_field(name="Countdown Logic", value="Countdowns start only on a confirmed `taken/on-server → not-taken/available` transition. Repeated not-taken rerun logs do not reset the timer.", inline=False)
+        embed.add_field(name="Countdown Logic", value="Countdowns start only on a confirmed `taken/on-server → not-taken/available` transition. Repeated not-taken rerun logs do not reset the timer. Details now show confidence: High for live checks, Medium for backfilled Discord log timestamps.", inline=False)
         embed.add_field(name="Countdown Commands", value=(
             f"`{p}invalid`\n`{p}invalid <vanity>`\n`{p}countdown <vanity>`\n"
             f"`{p}invalidrecent [limit]`\n`{p}invalidexpiring [limit]`\n`{p}topcountdowns [limit up to 500]`\n"
@@ -2013,8 +2428,8 @@ def build_help_page(page: int = 1) -> discord.Embed:
         ), inline=False)
         embed.add_field(name="Clean Rebuild", value=f"`{p}resetcountdowns`\n`{p}resetbackfill #log`\n`{p}backfillchannel #log 10000`\n`{p}verifycountdowns 500`", inline=False)
     else:
-        embed.add_field(name="Data / Saves", value=f"`{p}datastatus`\n`{p}savedata`\n`{p}exportdata`", inline=False)
-        embed.add_field(name="Files Saved", value="`vanity_config.json`, `vanity_statuses.json`, `invalid_vanities.json`, `expired_invalid_vanities.json`, `backfill_scan_state.json`, `backfill_transition_events.json`, and backups in `data/backups/`.", inline=False)
+        embed.add_field(name="Data / Saves", value=f"`{p}datastatus`\n`{p}savedata`\n`{p}exportdata`\n`{p}resumestatus`\n`{p}setautoresume on|off`\n`{p}clearresume`", inline=False)
+        embed.add_field(name="Files Saved", value="`vanity_config.json`, `vanity_statuses.json`, `invalid_vanities.json`, `expired_invalid_vanities.json`, `backfill_scan_state.json`, `backfill_transition_events.json`, `runtime_state.json`, and backups in `data/backups/`.", inline=False)
         embed.add_field(name="Prefix", value=f"`{p}setprefix <prefix>`", inline=False)
 
     embed.set_footer(text=f"Page {page}/{total}")
@@ -2322,14 +2737,24 @@ async def checklist(ctx, name: str):
         return
     await ctx.send(f"Starting check for `{name}`.")
     load_unavailable_cache()
-    await run_list_check(name, config["lists"][name], manual_ctx=ctx)
+    set_runtime_job("checklist", list_name=name, requested_by=str(ctx.author.id), guild_id=str(ctx.guild.id) if ctx.guild else None)
+    try:
+        await run_list_check(name, config["lists"][name], manual_ctx=ctx)
+    finally:
+        if not check_state.get("stop_requested"):
+            clear_runtime_job("checklist_completed")
 
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def checkall(ctx):
     await ctx.send("Starting all saved list checks.")
-    await run_all_checks(manual_ctx=ctx)
+    set_runtime_job("checkall", requested_by=str(ctx.author.id), guild_id=str(ctx.guild.id) if ctx.guild else None)
+    try:
+        await run_all_checks(manual_ctx=ctx)
+    finally:
+        if not check_state.get("stop_requested"):
+            clear_runtime_job("checkall_completed")
 
 
 @bot.command()
@@ -2338,6 +2763,7 @@ async def stop(ctx):
         await ctx.send("No check is currently running.")
         return
     check_state["stop_requested"] = True
+    clear_runtime_job("stopped_by_command")
     await ctx.send(f"Stop requested for `{check_state['mode']}`. Progress: `{check_state['current']}/{check_state['total']}`")
 
 
@@ -2380,6 +2806,79 @@ async def setalertchannel(ctx, channel: discord.TextChannel):
     config["invalid_alert_channel_id"] = channel.id
     save_config()
     await ctx.send(f"Countdown completion alerts will now go to {channel.mention} with `@everyone`.")
+
+
+@bot.command(name="alertstages", aliases=["countdownalerts", "stagestatus"])
+async def alertstages(ctx):
+    """Show current staged countdown alert settings."""
+    channel_id = config.get("invalid_alert_channel_id")
+    embed = discord.Embed(title="Countdown Alert Stages", color=discord.Color.gold())
+    embed.add_field(name="Enabled", value=f"`{config.get('alert_stages_enabled', True)}`", inline=True)
+    embed.add_field(name="Alert Channel", value=f"<#{channel_id}>" if channel_id else "Not set", inline=True)
+    embed.add_field(name="Stages", value="\n".join(f"`{stage_label(s)}`" for s in configured_alert_stages()), inline=False)
+    embed.add_field(name="Notes", value="Stages are saved per vanity, so restarts do not duplicate alerts. Backfilled countdowns skip stages that already passed before the rebuild.", inline=False)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="setalertstages", aliases=["setcountdownalerts"])
+@commands.has_permissions(administrator=True)
+async def setalertstages(ctx, *, stages: str = ""):
+    """Enable/disable staged alerts or set stages.
+
+    Examples:
+    !setalertstages default
+    !setalertstages off
+    !setalertstages 7d 24h 6h 1h
+    """
+    text = (stages or "default").strip().lower()
+    if text in {"off", "disable", "disabled", "false", "0"}:
+        config["alert_stages_enabled"] = False
+        save_config()
+        await ctx.send("Countdown stage alerts disabled. The final countdown-complete alert still works.")
+        return
+
+    if text in {"on", "enable", "enabled", "true"}:
+        config["alert_stages_enabled"] = True
+        save_config()
+        await ctx.send("Countdown stage alerts enabled.")
+        return
+
+    if text in {"default", "defaults", "reset"}:
+        config["alert_stages_enabled"] = True
+        config["countdown_alert_stages_seconds"] = DEFAULT_ALERT_STAGES_SECONDS.copy()
+        save_config()
+        await ctx.send("Countdown stage alerts reset to: `7 days`, `24 hours`, `6 hours`, `1 hour`.")
+        return
+
+    parsed = []
+    for part in re.split(r"[,\s]+", text):
+        if not part:
+            continue
+        match = re.fullmatch(r"(\d+)(d|day|days|h|hr|hrs|hour|hours|m|min|mins|minute|minutes)?", part)
+        if not match:
+            await ctx.send(f"Could not understand `{part}`. Use examples like `7d 24h 6h 1h`.")
+            return
+        amount = int(match.group(1))
+        unit = match.group(2) or "h"
+        if unit.startswith("d"):
+            seconds = amount * 86400
+        elif unit.startswith("m"):
+            seconds = amount * 60
+        else:
+            seconds = amount * 3600
+        if seconds <= 0 or seconds >= COUNTDOWN_DAYS * 86400:
+            await ctx.send(f"Stage `{part}` must be greater than 0 and less than `{COUNTDOWN_DAYS}` days.")
+            return
+        parsed.append(seconds)
+
+    if not parsed:
+        await ctx.send("Give stages like `7d 24h 6h 1h`, or use `default`, `on`, or `off`.")
+        return
+
+    config["alert_stages_enabled"] = True
+    config["countdown_alert_stages_seconds"] = sorted(set(parsed), reverse=True)
+    save_config()
+    await ctx.send("Countdown stage alerts set to:\n" + "\n".join(f"• `{stage_label(s)}`" for s in configured_alert_stages()))
 
 
 @bot.command(name="invalid")
@@ -2847,8 +3346,19 @@ async def backfillchannel(ctx, channel: discord.TextChannel, limit_per_channel: 
     status_msg = await ctx.send(
         f"Backfilling countdowns from {channel.mention}... scanning up to `{limit_per_channel}` messages."
     )
-    stats = await rebuild_countdowns_from_messages([channel], limit_per_channel, list_label=f"manual:{channel.name}")
-    await status_msg.edit(content=None, embed=build_backfill_result_embed("Manual Channel Backfill Complete", stats))
+    set_runtime_job(
+        "backfillchannel",
+        channel_id=str(channel.id),
+        channel_name=channel.name,
+        limit_per_channel=int(limit_per_channel),
+        requested_by=str(ctx.author.id),
+        guild_id=str(ctx.guild.id) if ctx.guild else None,
+    )
+    try:
+        stats = await rebuild_countdowns_from_messages([channel], limit_per_channel, list_label=f"manual:{channel.name}")
+        await status_msg.edit(content=None, embed=build_backfill_result_embed("Manual Channel Backfill Complete", stats))
+    finally:
+        clear_runtime_job("backfillchannel_completed")
 
 
 
@@ -2943,8 +3453,17 @@ async def backfillinvalid(ctx, limit_per_log_channel: int = 5000):
         await status_msg.edit(content="No log channels found in saved lists. Use `!backfillchannel #log 5000` to scan a channel manually, or set list channels first.")
         return
 
-    stats = await rebuild_countdowns_from_messages(log_channels, limit_per_log_channel, list_label="saved-log")
-    await status_msg.edit(content=None, embed=build_backfill_result_embed("Saved Log Backfill Complete", stats))
+    set_runtime_job(
+        "backfillinvalid",
+        limit_per_log_channel=int(limit_per_log_channel),
+        requested_by=str(ctx.author.id),
+        guild_id=str(ctx.guild.id) if ctx.guild else None,
+    )
+    try:
+        stats = await rebuild_countdowns_from_messages(log_channels, limit_per_log_channel, list_label="saved-log")
+        await status_msg.edit(content=None, embed=build_backfill_result_embed("Saved Log Backfill Complete", stats))
+    finally:
+        clear_runtime_job("backfillinvalid_completed")
 
 
 @bot.command(name="unavailablecount")
@@ -2997,11 +3516,52 @@ def file_size_label(path: Path) -> str:
     return f"{size / (1024 * 1024):.1f} MB"
 
 
+
+@bot.command(name="resumestatus", aliases=["runtimestatus", "jobstatus"])
+async def resumestatus(ctx):
+    """Show any saved job that will resume after a restart."""
+    load_runtime_state()
+    embed = discord.Embed(title="Runtime Resume Status", color=discord.Color.blurple())
+    embed.add_field(name="Auto Resume", value="Enabled" if config.get("auto_resume_running_jobs", True) else "Disabled", inline=True)
+    embed.add_field(name="Currently Running", value="Yes" if check_state.get("running") else "No", inline=True)
+    embed.add_field(name="Saved Active Job", value=describe_runtime_job(), inline=False)
+    history = runtime_state.get("resume_history") if isinstance(runtime_state.get("resume_history"), list) else []
+    if history:
+        lines = []
+        for item in history[:5]:
+            lines.append(f"`{item.get('type', 'unknown')}` • {item.get('finish_reason', 'finished')} • {discord_relative(item.get('finished_at')) if item.get('finished_at') else 'unknown'}")
+        embed.add_field(name="Recent Finished Jobs", value="\n".join(lines), inline=False)
+    embed.set_footer(text="Saved manual checks/backfills will restart after bot restarts when auto resume is enabled.")
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="setautoresume", aliases=["autoresume"])
+@commands.has_permissions(administrator=True)
+async def setautoresume(ctx, mode: str):
+    mode = str(mode).lower().strip()
+    if mode not in {"on", "off", "true", "false", "yes", "no", "enable", "disable", "enabled", "disabled"}:
+        await ctx.send("Use `on` or `off`. Example: `!setautoresume on`")
+        return
+    enabled = mode in {"on", "true", "yes", "enable", "enabled"}
+    config["auto_resume_running_jobs"] = enabled
+    save_config()
+    await ctx.send(f"Auto-resume interrupted checks/backfills is now `{'Enabled' if enabled else 'Disabled'}`.")
+
+
+@bot.command(name="clearresume", aliases=["clearjob", "clearruntime"])
+@commands.has_permissions(administrator=True)
+async def clearresume(ctx):
+    """Clear the saved active runtime job without deleting lists/countdowns."""
+    clear_runtime_job("cleared_by_command")
+    await ctx.send("Cleared the saved active runtime job. Lists, countdowns, statuses, and backfill progress were not deleted.")
+
+
 @bot.command(name="datastatus", aliases=["savestatus", "persistence"])
 async def datastatus(ctx):
     load_config()
     load_invalid_tracker()
     load_backfill_progress()
+    load_runtime_state()
 
     uses_volume = str(DATA_DIR).startswith("/data")
     embed = discord.Embed(title="Vanity Bot Data Status", color=discord.Color.blurple())
@@ -3013,10 +3573,12 @@ async def datastatus(ctx):
     embed.add_field(name="Backfill Channels", value=f"`{len(backfill_scan_state)}`", inline=True)
     embed.add_field(name="Backfill Events", value=f"`{len(backfill_transition_events)}`", inline=True)
     embed.add_field(name="Saved Vanity Statuses", value=f"`{len(vanity_statuses)}`", inline=True)
+    embed.add_field(name="Auto Resume", value="`Enabled`" if config.get("auto_resume_running_jobs", True) else "`Disabled`", inline=True)
+    embed.add_field(name="Saved Runtime Job", value=describe_runtime_job(), inline=False)
 
     files = [
         CONFIG_FILE, ACTIVE_INVALID_FILE, EXPIRED_INVALID_FILE,
-        BACKFILL_STATE_FILE, BACKFILL_EVENTS_FILE, EVENT_LOG_FILE,
+        BACKFILL_STATE_FILE, BACKFILL_EVENTS_FILE, VANITY_STATUS_FILE, RUNTIME_STATE_FILE, EVENT_LOG_FILE,
     ]
     file_lines = [f"`{path.name}` — {file_size_label(path)}" for path in files]
     embed.add_field(name="Saved Files", value="\n".join(file_lines), inline=False)
@@ -3121,6 +3683,7 @@ async def on_ready():
     load_invalid_tracker()
     load_backfill_progress()
     load_vanity_statuses()
+    load_runtime_state()
     seed_statuses_from_not_taken_files()
 
     if not auto_check_loop.is_running():
@@ -3139,7 +3702,9 @@ async def on_ready():
         except Exception as e:
             logger.warning("Slash command sync failed: %s", e)
             write_event_log("slash_command_sync_failed", {"error": short_text(e, 200)})
+    runtime_state["last_startup_at"] = now_iso()
     save_all_data(reason="startup_sync")
+    bot.loop.create_task(resume_saved_runtime_job())
 
     logger.info(
         "Logged in as %s | Prefix: %s | Data dir: %s | Lists: %s | Active countdowns: %s | Expired countdowns: %s",
@@ -3152,6 +3717,7 @@ async def on_ready():
     )
 
 def handle_shutdown_signal(signum=None, frame=None):
+    runtime_state["last_shutdown_at"] = now_iso()
     save_all_data(reason=f"shutdown_signal_{signum}")
 
 
@@ -3170,6 +3736,7 @@ if __name__ == "__main__":
     load_invalid_tracker()
     load_backfill_progress()
     load_vanity_statuses()
+    load_runtime_state()
     seed_statuses_from_not_taken_files()
     write_event_log("bot_process_starting", {"data_dir": str(DATA_DIR), "lists": len(config.get("lists", {}))})
     if not TOKEN:
