@@ -2420,6 +2420,8 @@ def build_help_page(page: int = 1) -> discord.Embed:
     elif page == 5:
         embed.add_field(name="Backfill Logic", value="Backfill groups logs by vanity, sorts oldest→newest, then uses the FIRST not-taken log after the most recent taken log. If the newest state is taken, no countdown is kept.", inline=False)
         embed.add_field(name="Backfill Commands", value=(
+            f"`{p}search <vanity> [more...]` — targeted search saved log channels\n"
+            f"`{p}search #log <vanity> [more...]` — targeted search one channel\n"
             f"`{p}backfillchannel #channel [message_limit]`\n"
             f"`{p}backfillinvalid [messages_per_log_channel]`\n"
             f"`{p}backfillstatus [#channel]`\n"
@@ -3096,6 +3098,223 @@ async def invalidexport(ctx):
     )
 
 
+
+
+async def get_configured_log_channels() -> list[discord.TextChannel]:
+    """Return unique saved log channels from configured vanity lists."""
+    channels: list[discord.TextChannel] = []
+    seen: set[int] = set()
+    for _, raw_data in config.get("lists", {}).items():
+        data = normalize_list_record(raw_data)
+        cid = data.get("log_channel_id")
+        try:
+            cid_int = int(cid)
+        except Exception:
+            continue
+        if cid_int in seen:
+            continue
+        channel = await get_channel(cid_int)
+        if isinstance(channel, discord.TextChannel):
+            channels.append(channel)
+            seen.add(cid_int)
+    return channels
+
+
+def resolve_optional_channel_from_args(ctx, args: tuple[str, ...]) -> tuple[Optional[discord.TextChannel], list[str]]:
+    """Allow syntax like !search #log mean act, while keeping !search mean act simple."""
+    tokens = list(args)
+    if not tokens or not getattr(ctx, "guild", None):
+        return None, tokens
+
+    raw = tokens[0].strip()
+    channel_id = None
+    mention_match = re.fullmatch(r"<#(\d+)>", raw)
+    if mention_match:
+        channel_id = int(mention_match.group(1))
+    elif raw.isdigit():
+        # Only treat a numeric first token as a channel if that channel exists.
+        possible = ctx.guild.get_channel(int(raw))
+        if isinstance(possible, discord.TextChannel):
+            channel_id = int(raw)
+
+    if channel_id:
+        channel = ctx.guild.get_channel(channel_id)
+        if isinstance(channel, discord.TextChannel):
+            return channel, tokens[1:]
+
+    return None, tokens
+
+
+async def search_vanities_in_log_channels(
+    channels: list[discord.TextChannel],
+    codes: list[str],
+    *,
+    limit_per_channel: int = 50000,
+    list_label: str = "targeted-search",
+) -> dict:
+    """Search chosen log channel(s) for specific vanity codes only.
+
+    This does not use the incremental cursor, because the point of !search is to
+    manually target a vanity and rescan the log history for that vanity. Event
+    keys still prevent duplicate stored events, and the strict status-run replay
+    decides whether a countdown should exist.
+    """
+    load_backfill_progress()
+    wanted = {clean_code(code) for code in codes if clean_code(code)}
+    wanted = {code for code in wanted if is_countdown_trackable(code)}
+
+    scanned = 0
+    matched_available = 0
+    matched_taken = 0
+    new_events_saved = 0
+    duplicate_events = 0
+    failed_channels: list[str] = []
+    channel_notes: list[str] = []
+    per_code_matches: dict[str, dict] = {code: {"available": 0, "taken": 0, "new": 0, "duplicate": 0} for code in wanted}
+
+    if not wanted:
+        return {
+            "scanned": 0,
+            "matched_available": 0,
+            "matched_taken": 0,
+            "new_events_saved": 0,
+            "duplicate_events": 0,
+            "failed_channels": [],
+            "channel_notes": ["No valid vanity codes matched the countdown length filter."],
+            "searched_codes": [],
+            "per_code_matches": {},
+            "active_total": len(active_invalid_vanities),
+            "expired_total": len(expired_invalid_vanities),
+        }
+
+    for channel in channels:
+        channel_scanned = 0
+        try:
+            messages = [m async for m in channel.history(limit=limit_per_channel, oldest_first=True)]
+            scanned += len(messages)
+            channel_scanned = len(messages)
+            channel_label = f"{list_label}:{channel.id}"
+
+            for message in messages:
+                events = extract_transition_events_from_message(message, channel_label)
+                for event in events:
+                    code = clean_code(event.get("code", ""))
+                    if code not in wanted:
+                        continue
+
+                    if event["event_type"] == "available":
+                        matched_available += 1
+                        per_code_matches[code]["available"] += 1
+                    elif event["event_type"] == "taken":
+                        matched_taken += 1
+                        per_code_matches[code]["taken"] += 1
+
+                    key = backfill_event_key(event["channel_id"], event["message_id"], event["event_type"], code)
+                    if key in backfill_transition_events:
+                        duplicate_events += 1
+                        per_code_matches[code]["duplicate"] += 1
+                    else:
+                        backfill_transition_events[key] = event
+                        new_events_saved += 1
+                        per_code_matches[code]["new"] += 1
+
+            channel_notes.append(f"#{getattr(channel, 'name', channel.id)}: scanned {channel_scanned} messages")
+        except discord.Forbidden:
+            failed_channels.append(f"#{getattr(channel, 'name', channel.id)} (missing Read Message History permission)")
+        except Exception as e:
+            failed_channels.append(f"#{getattr(channel, 'name', channel.id)} ({short_text(e, 80)})")
+
+    save_backfill_progress()
+    replay_stats = replay_stored_backfill_events_to_tracker()
+
+    return {
+        "scanned": scanned,
+        "initial_messages_scanned": scanned,
+        "new_messages_scanned": 0,
+        "older_messages_scanned": 0,
+        "matched_available": matched_available,
+        "matched_taken": matched_taken,
+        "new_events_saved": new_events_saved,
+        "duplicate_events": duplicate_events,
+        "stored_events_total": replay_stats.get("stored_events_total", len(backfill_transition_events)),
+        "added_active": replay_stats.get("added_active", 0),
+        "updated_active": replay_stats.get("updated_active", 0),
+        "moved_expired": replay_stats.get("moved_expired", 0),
+        "replaced_expired": replay_stats.get("replaced_expired", 0),
+        "removed_by_taken": replay_stats.get("removed_by_taken", 0),
+        "skipped_latest_taken": replay_stats.get("skipped_latest_taken", replay_stats.get("removed_by_taken", 0)),
+        "skipped_no_prior_taken": replay_stats.get("skipped_no_prior_taken", 0),
+        "ignored_repeat_available": replay_stats.get("ignored_repeat_available", 0),
+        "ignored_repeat_taken": replay_stats.get("ignored_repeat_taken", 0),
+        "replaced_newer_existing_with_earlier_streak": replay_stats.get("replaced_newer_existing_with_earlier_streak", 0),
+        "active_total": len(active_invalid_vanities),
+        "expired_total": len(expired_invalid_vanities),
+        "failed_channels": failed_channels,
+        "channel_notes": channel_notes,
+        "searched_codes": sorted(wanted),
+        "per_code_matches": per_code_matches,
+    }
+
+
+def build_targeted_search_embed(codes: list[str], channels: list[discord.TextChannel], stats: dict) -> discord.Embed:
+    embed = discord.Embed(
+        title="Targeted Vanity Log Search Complete",
+        description="Searched stored log history for specific vanities and rebuilt countdowns with strict status-run logic.",
+        color=discord.Color.green(),
+    )
+    embed.add_field(name="Searched Vanities", value=", ".join(f"`discord.gg/{c}`" for c in codes[:25]) or "None", inline=False)
+    embed.add_field(name="Channels", value=", ".join(ch.mention for ch in channels[:10]) or "None", inline=False)
+    embed.add_field(name="Messages Scanned", value=str(stats.get("scanned", 0)), inline=True)
+    embed.add_field(name="Not-Taken Logs Found", value=str(stats.get("matched_available", 0)), inline=True)
+    embed.add_field(name="Taken Logs Found", value=str(stats.get("matched_taken", 0)), inline=True)
+    embed.add_field(name="New Events Saved", value=str(stats.get("new_events_saved", 0)), inline=True)
+    embed.add_field(name="Duplicate Events Skipped", value=str(stats.get("duplicate_events", 0)), inline=True)
+    embed.add_field(name="Active Total", value=str(stats.get("active_total", len(active_invalid_vanities))), inline=True)
+
+    events_by_code = get_events_by_code_from_backfill()
+    per_code = stats.get("per_code_matches", {}) if isinstance(stats.get("per_code_matches"), dict) else {}
+    lines: list[str] = []
+    for code in codes[:30]:
+        active = active_invalid_vanities.get(code)
+        expired = expired_invalid_vanities.get(code)
+        events = events_by_code.get(code, [])
+        matches = per_code.get(code, {}) if isinstance(per_code.get(code, {}), dict) else {}
+        found_text = f"found A:{matches.get('available', 0)} T:{matches.get('taken', 0)}"
+
+        if active:
+            start_dt = parse_iso_dt(active.get("taken_at") or active.get("invalid_at"))
+            expires_dt = parse_iso_dt(active.get("expires_at"))
+            start_text = f"<t:{int(start_dt.timestamp())}:R>" if start_dt else "unknown"
+            expires_text = f"<t:{int(expires_dt.timestamp())}:R>" if expires_dt else "unknown"
+            lines.append(f"`discord.gg/{code}` — **active** • started {start_text} • ends {expires_text} • {found_text}")
+        elif expired:
+            expired_dt = parse_iso_dt(expired.get("expired_at") or expired.get("expires_at"))
+            expired_text = f"<t:{int(expired_dt.timestamp())}:R>" if expired_dt else "unknown"
+            lines.append(f"`discord.gg/{code}` — **expired list** • expired {expired_text} • {found_text}")
+        elif events:
+            runs = compress_status_runs(events)
+            latest = runs[-1]["status"] if runs else "unknown"
+            if latest == "taken":
+                reason = "newest log says taken/on-server"
+            else:
+                reason = "no prior taken log found before current not-taken run"
+            lines.append(f"`discord.gg/{code}` — **no countdown** • {reason} • {found_text}")
+        else:
+            lines.append(f"`discord.gg/{code}` — **no logs found**")
+
+    for chunk_index, chunk in enumerate(split_embed_lines(lines, max_chars=1000), start=1):
+        embed.add_field(name="Results" if chunk_index == 1 else f"Results {chunk_index}", value=chunk, inline=False)
+
+    failed = stats.get("failed_channels") or []
+    if failed:
+        embed.add_field(name="Skipped Channels", value="\n".join(failed[:8]), inline=False)
+    notes = stats.get("channel_notes") or []
+    if notes:
+        embed.add_field(name="Channel Notes", value="\n".join(notes[:5]), inline=False)
+
+    embed.set_footer(text="Use !backfilltimeline <vanity> to inspect the compressed taken/not-taken runs for one vanity.")
+    return embed
+
 async def rebuild_countdowns_from_messages(
     channels: list[discord.TextChannel],
     limit_per_channel: int,
@@ -3330,6 +3549,68 @@ async def backfilltimeline(ctx, vanity: str, limit: int = 30):
         return
     load_backfill_progress()
     await ctx.send(embed=build_backfill_timeline_embed(code, limit=limit))
+
+
+
+
+@bot.command(name="search", aliases=["searchvanity", "searchlogs", "findvanity", "findcountdown"])
+@commands.has_permissions(administrator=True)
+async def search_command(ctx, *items: str):
+    """Search log history for one or more specific vanities and rebuild their countdowns.
+
+    Syntax:
+    !search mean act sue
+    !search #log mean act sue
+    """
+    if not items:
+        await ctx.send(
+            "Incorrect syntax:\n"
+            f"`{config.get('prefix', DEFAULT_PREFIX)}search <vanity> [more_vanities...]`\n"
+            f"`{config.get('prefix', DEFAULT_PREFIX)}search #log <vanity> [more_vanities...]`"
+        )
+        return
+
+    chosen_channel, vanity_tokens = resolve_optional_channel_from_args(ctx, items)
+    codes = parse_words(" ".join(vanity_tokens))
+    codes = [code for code in codes if is_countdown_trackable(code)]
+
+    if not codes:
+        await ctx.send(f"No valid vanity codes found. Current countdown length filter is `{countdown_filter_label()}`.")
+        return
+
+    # Keep the command safe to run in Discord while still allowing many targets.
+    if len(codes) > 25:
+        await ctx.send("Search up to `25` vanities at once so the embed/results stay readable.")
+        return
+
+    if chosen_channel:
+        channels = [chosen_channel]
+    else:
+        channels = await get_configured_log_channels()
+        if not channels:
+            # Fallback to the current channel if no configured log channels exist.
+            if isinstance(ctx.channel, discord.TextChannel):
+                channels = [ctx.channel]
+            else:
+                await ctx.send("No saved log channels were found. Use `!search #log mean` or set list channels first.")
+                return
+
+    limit_per_channel = 50000
+    status_msg = await ctx.send(
+        f"Searching `{len(codes)}` vanity/vanities in `{len(channels)}` log channel(s), up to `{limit_per_channel}` messages each..."
+    )
+
+    stats = await search_vanities_in_log_channels(
+        channels,
+        codes,
+        limit_per_channel=limit_per_channel,
+        list_label=f"targeted-search:{ctx.author.id}",
+    )
+    embed = build_targeted_search_embed(codes, channels, stats)
+    try:
+        await status_msg.edit(content=None, embed=embed)
+    except Exception:
+        await ctx.send(embed=embed)
 
 
 @bot.command(name="backfillchannel", aliases=["backfillinvalidchannel", "backfillfromchannel"])
