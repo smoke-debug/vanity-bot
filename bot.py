@@ -14,6 +14,7 @@ from typing import Optional, Tuple, Any
 
 import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 
 # =========================
@@ -71,6 +72,7 @@ ACTIVE_INVALID_FILE = DATA_DIR / "invalid_vanities.json"
 EXPIRED_INVALID_FILE = DATA_DIR / "expired_invalid_vanities.json"
 BACKFILL_STATE_FILE = DATA_DIR / "backfill_scan_state.json"
 BACKFILL_EVENTS_FILE = DATA_DIR / "backfill_transition_events.json"
+VANITY_STATUS_FILE = DATA_DIR / "vanity_statuses.json"
 EVENT_LOG_FILE = DATA_DIR / "bot_events.log"
 BACKUP_DIR = DATA_DIR / "backups"
 COUNTDOWN_DAYS = 30
@@ -110,6 +112,7 @@ def get_prefix(bot_obj, message):
 
 
 bot = commands.Bot(command_prefix=get_prefix, intents=intents, help_command=None)
+_slash_commands_synced = False
 
 # Stores not-taken / available words, even though older command/file names say unavailable.
 unavailable_cache = defaultdict(set)
@@ -124,6 +127,12 @@ expired_invalid_vanities: dict[str, dict] = {}
 # can continue from unscanned messages instead of rescanning the same history.
 backfill_scan_state: dict[str, dict] = {}
 backfill_transition_events: dict[str, dict] = {}
+
+# Persistent last-known status per vanity. This prevents first scans, lost TXT
+# files, or redeploys from creating fake fresh countdowns for every currently
+# available vanity. A countdown only starts when the previous saved status was
+# taken/on-server and the newest check is available.
+vanity_statuses: dict[str, dict] = {}
 
 check_state = {
     "running": False,
@@ -243,6 +252,7 @@ def save_all_data(reason: str = "manual") -> None:
         save_config()
         save_invalid_tracker()
         save_backfill_progress()
+        save_vanity_statuses()
         for length in TRACKED_LENGTHS:
             rewrite_unavailable_file(length)
         write_event_log("all_data_saved", {
@@ -628,6 +638,95 @@ def save_backfill_progress() -> None:
     })
 
 
+def load_vanity_statuses() -> None:
+    """Load persistent last-known invite statuses.
+
+    Status values:
+    - available = Discord returned 404 / not taken
+    - taken = Discord returned 200 / on server
+
+    These statuses are separate from the old not-taken TXT files so the bot
+    can survive updates/restarts without treating every available vanity as a
+    brand-new transition.
+    """
+    vanity_statuses.clear()
+    raw = read_json_file(VANITY_STATUS_FILE, {})
+    if not isinstance(raw, dict):
+        return
+    for code, record in raw.items():
+        code = clean_code(code)
+        if not code:
+            continue
+        if isinstance(record, str):
+            status = record.lower()
+            record = {"code": code, "last_status": status, "last_checked_at": None}
+        elif isinstance(record, dict):
+            status = str(record.get("last_status", "")).lower()
+        else:
+            continue
+        if status not in {"available", "taken"}:
+            continue
+        out = dict(record)
+        out["code"] = code
+        out["last_status"] = status
+        vanity_statuses[code] = out
+
+
+def save_vanity_statuses() -> None:
+    write_json_file(VANITY_STATUS_FILE, vanity_statuses, label="vanity_statuses", backup=True)
+    write_event_log("vanity_statuses_saved", {"statuses": len(vanity_statuses)})
+
+
+def get_last_vanity_status(code: str) -> Optional[str]:
+    code = clean_code(code)
+    record = vanity_statuses.get(code)
+    if not isinstance(record, dict):
+        return None
+    status = str(record.get("last_status", "")).lower()
+    return status if status in {"available", "taken"} else None
+
+
+def set_last_vanity_status(code: str, status: str, *, list_name: str = "unknown", source: str = "checker", checked_at: Optional[str] = None, save: bool = False) -> None:
+    code = clean_code(code)
+    status = str(status).lower()
+    if not code or status not in {"available", "taken"}:
+        return
+    timestamp = checked_at or now_iso()
+    previous = vanity_statuses.get(code, {}) if isinstance(vanity_statuses.get(code), dict) else {}
+    vanity_statuses[code] = {
+        "code": code,
+        "last_status": status,
+        "last_checked_at": timestamp,
+        "last_list": list_name or previous.get("last_list") or "unknown",
+        "last_source": source,
+        "previous_status": previous.get("last_status"),
+        "updated_at": timestamp,
+        "created_at": previous.get("created_at") or timestamp,
+    }
+    if save:
+        save_vanity_statuses()
+
+
+def seed_statuses_from_not_taken_files() -> int:
+    """Best-effort migration for older installs.
+
+    Old versions only had TXT files of currently not-taken/available words.
+    On startup we mark those as available so a fresh deploy does not start a
+    countdown for every word it sees again. This does NOT create countdowns.
+    """
+    added = 0
+    timestamp = now_iso()
+    for length in TRACKED_LENGTHS:
+        for code in list(unavailable_cache[length]):
+            if code and code not in vanity_statuses:
+                set_last_vanity_status(code, "available", list_name="txt_seed", source="startup_txt_seed", checked_at=timestamp, save=False)
+                added += 1
+    if added:
+        save_vanity_statuses()
+        write_event_log("vanity_statuses_seeded_from_txt", {"added": added})
+    return added
+
+
 def backfill_event_key(channel_id: int, message_id: int, event_type: str, code: str) -> str:
     return f"{int(channel_id)}:{int(message_id)}:{event_type}:{clean_code(code)}"
 
@@ -717,45 +816,124 @@ def reset_backfill_channel_state(channel_id: int) -> bool:
     return had_state
 
 
-def replay_stored_backfill_events_to_tracker() -> dict:
-    """Replay all stored backfill transition events chronologically and merge into tracker files."""
-    timeline = []
+def get_events_by_code_from_backfill() -> dict[str, list[tuple[datetime, int, str, str, int]]]:
+    """Return stored backfill events grouped by vanity code.
+
+    Tuple format: (event_dt, message_id, event_type, source, channel_id)
+    """
+    events_by_code: dict[str, list[tuple[datetime, int, str, str, int]]] = defaultdict(list)
     for event in backfill_transition_events.values():
         event_dt = parse_iso_dt(event.get("event_at"))
         code = clean_code(event.get("code", ""))
         event_type = str(event.get("event_type", "")).lower()
         if event_dt and code and is_countdown_trackable(code) and event_type in {"available", "taken"}:
-            timeline.append((event_dt, int(event.get("message_id", 0)), event_type, code, event.get("source", "backfill")))
+            events_by_code[code].append((
+                event_dt,
+                int(event.get("message_id", 0)),
+                event_type,
+                event.get("source", "backfill"),
+                int(event.get("channel_id", 0) or 0),
+            ))
+    for code in events_by_code:
+        events_by_code[code].sort(key=lambda item: (item[0], item[1]))
+    return events_by_code
 
-    timeline.sort(key=lambda item: (item[0], item[1]))
+
+def compress_status_runs(events: list[tuple[datetime, int, str, str, int]]) -> list[dict]:
+    """Collapse repeated same-status logs into compact runs.
+
+    Example: taken, taken, taken, available, available ->
+    [taken x3, available x2]
+    """
+    runs: list[dict] = []
+    for event_dt, message_id, event_type, source, channel_id in sorted(events, key=lambda item: (item[0], item[1])):
+        if runs and runs[-1]["status"] == event_type:
+            run = runs[-1]
+            run["count"] += 1
+            run["last_at"] = event_dt.isoformat()
+            run["last_message_id"] = message_id
+            run["last_source"] = source
+            run["last_channel_id"] = channel_id
+        else:
+            runs.append({
+                "status": event_type,
+                "count": 1,
+                "first_at": event_dt.isoformat(),
+                "last_at": event_dt.isoformat(),
+                "first_message_id": message_id,
+                "last_message_id": message_id,
+                "first_source": source,
+                "last_source": source,
+                "first_channel_id": channel_id,
+                "last_channel_id": channel_id,
+            })
+    return runs
+
+
+def replay_stored_backfill_events_to_tracker() -> dict:
+    """Replay stored backfill log events using strict status-run logic.
+
+    This is the accuracy rule:
+
+        taken/on-server -> FIRST not-taken/available after that = countdown start
+
+    Repeated not-taken logs from rerunning the same list do NOT reset the timer.
+    Repeated taken logs are collapsed/ignored. If the newest state is taken, no
+    countdown is kept. If the scanned history only shows available logs and no
+    earlier taken/on-server event, the bot skips it because it cannot prove when
+    it actually became available.
+    """
+    events_by_code = get_events_by_code_from_backfill()
 
     reconstructed: dict[str, dict] = {}
     removed_by_taken = set()
-    latest_event_by_code: dict[str, dict] = {}
-    for event_dt, message_id, event_type, code, label in timeline:
-        latest_event_by_code[code] = {
-            "event_type": event_type,
-            "event_at": event_dt.isoformat(),
-            "message_id": message_id,
-            "source": label,
-        }
-        if event_type == "available":
-            reconstructed[code] = make_tracker_record(code, label, taken_at=event_dt.isoformat(), source="backfill_available_transition")
-            reconstructed[code]["source_message_id"] = message_id
-            removed_by_taken.discard(code)
-        elif event_type == "taken":
-            reconstructed.pop(code, None)
-            removed_by_taken.add(code)
+    skipped_latest_taken = 0
+    ignored_repeat_available = 0
+    ignored_repeat_taken = 0
+    skipped_no_prior_taken = 0
+
+    for code, events in events_by_code.items():
+        current_status: Optional[str] = None
+        current_available_start: Optional[tuple[datetime, int, str]] = None
+        seen_taken_before_current_available = False
+        ever_saw_taken = False
+
+        for event_dt, message_id, event_type, label, channel_id in events:
+            if event_type == "taken":
+                ever_saw_taken = True
+                if current_status != "taken":
+                    current_status = "taken"
+                    current_available_start = None
+                    seen_taken_before_current_available = False
+                else:
+                    ignored_repeat_taken += 1
+                continue
+
+            if event_type == "available":
+                if current_status != "available":
+                    # First available log after the most recent taken/on-server run.
+                    current_status = "available"
+                    current_available_start = (event_dt, message_id, label)
+                    seen_taken_before_current_available = ever_saw_taken
+                else:
+                    # Rerun log while it is still available; keep the original start.
+                    ignored_repeat_available += 1
+                continue
+
+        if current_status == "available" and current_available_start and seen_taken_before_current_available:
+            start_dt, source_message_id, label = current_available_start
+            record = make_tracker_record(code, label, taken_at=start_dt.isoformat(), source="backfill_first_available_after_taken_run")
+            record["source_message_id"] = source_message_id
+            record["backfill_logic"] = "first_available_after_most_recent_taken_strict"
+            reconstructed[code] = record
+        elif current_status == "available" and current_available_start and not seen_taken_before_current_available:
+            # This avoids fake countdowns when the scan only found repeated available logs.
+            skipped_no_prior_taken += 1
             active_invalid_vanities.pop(code, None)
             expired_invalid_vanities.pop(code, None)
-
-    # Safety pass: only keep countdown candidates whose most recent stored update is "available".
-    # If the newest scanned log for a vanity says it is taken/on-server, do not create/keep a countdown.
-    for code in list(reconstructed.keys()):
-        latest = latest_event_by_code.get(code, {})
-        if latest.get("event_type") != "available":
-            reconstructed.pop(code, None)
+        else:
             removed_by_taken.add(code)
+            skipped_latest_taken += 1
             active_invalid_vanities.pop(code, None)
             expired_invalid_vanities.pop(code, None)
 
@@ -763,8 +941,16 @@ def replay_stored_backfill_events_to_tracker() -> dict:
     updated_active = 0
     moved_expired = 0
     replaced_expired = 0
-    kept_newer_existing = 0
+    replaced_newer_existing_with_earlier_streak = 0
     now_dt = datetime.now(timezone.utc)
+
+    # Remove any saved countdown whose newest reconstructed state is not a confirmed available run.
+    for code in list(active_invalid_vanities.keys()):
+        if code in events_by_code and code not in reconstructed:
+            active_invalid_vanities.pop(code, None)
+    for code in list(expired_invalid_vanities.keys()):
+        if code in events_by_code and code not in reconstructed:
+            expired_invalid_vanities.pop(code, None)
 
     for code, record in reconstructed.items():
         record_dt = parse_iso_dt(record.get("taken_at") or record.get("invalid_at"))
@@ -772,16 +958,10 @@ def replay_stored_backfill_events_to_tracker() -> dict:
         existing_expired = expired_invalid_vanities.get(code)
         existing_active_dt = parse_iso_dt((existing_active or {}).get("taken_at") or (existing_active or {}).get("invalid_at"))
         existing_expired_dt = parse_iso_dt((existing_expired or {}).get("taken_at") or (existing_expired or {}).get("invalid_at"))
+        newest_existing_dt = max([d for d in (existing_active_dt, existing_expired_dt) if d], default=None)
 
-        # Do not overwrite a newer live tracker record with an older backfilled event.
-        newest_existing_dt = None
-        if existing_active_dt and existing_expired_dt:
-            newest_existing_dt = max(existing_active_dt, existing_expired_dt)
-        else:
-            newest_existing_dt = existing_active_dt or existing_expired_dt
         if newest_existing_dt and record_dt and newest_existing_dt > record_dt:
-            kept_newer_existing += 1
-            continue
+            replaced_newer_existing_with_earlier_streak += 1
 
         expires_dt = parse_iso_dt(record.get("expires_at"))
         if expires_dt and expires_dt <= now_dt:
@@ -812,19 +992,31 @@ def replay_stored_backfill_events_to_tracker() -> dict:
             added_active += 1
 
     save_invalid_tracker()
+    write_event_log("backfill_replayed_status_runs", {
+        "vanities_with_events": len(events_by_code),
+        "reconstructed_available": len(reconstructed),
+        "skipped_latest_taken": skipped_latest_taken,
+        "skipped_available_without_prior_taken": skipped_no_prior_taken,
+        "repeated_available_logs_ignored": ignored_repeat_available,
+        "repeated_taken_logs_ignored": ignored_repeat_taken,
+        "replaced_newer_existing_with_earlier_streak": replaced_newer_existing_with_earlier_streak,
+    })
     return {
         "stored_events_total": len(backfill_transition_events),
+        "vanities_with_events": len(events_by_code),
         "added_active": added_active,
         "updated_active": updated_active,
         "moved_expired": moved_expired,
         "replaced_expired": replaced_expired,
         "removed_by_taken": len(removed_by_taken),
-        "skipped_latest_taken": len(removed_by_taken),
-        "kept_newer_existing": kept_newer_existing,
+        "skipped_latest_taken": skipped_latest_taken,
+        "skipped_no_prior_taken": skipped_no_prior_taken,
+        "ignored_repeat_available": ignored_repeat_available,
+        "ignored_repeat_taken": ignored_repeat_taken,
+        "replaced_newer_existing_with_earlier_streak": replaced_newer_existing_with_earlier_streak,
         "active_total": len(active_invalid_vanities),
         "expired_total": len(expired_invalid_vanities),
     }
-
 
 def make_tracker_record(code: str, list_name: str, taken_at: Optional[str] = None, source: str = "checker") -> dict:
     # The parameter name is kept as taken_at for compatibility with older saved JSON.
@@ -1053,38 +1245,59 @@ def split_embed_lines(lines: list[str], max_chars: int = 1000) -> list[str]:
     return chunks
 
 
-def build_top_shortest_countdowns_embed(limit: int = 50) -> discord.Embed:
-    limit = max(1, min(int(limit), 50))
+def build_top_shortest_countdowns_embeds(limit: int = 50, per_embed: int = 45) -> list[discord.Embed]:
+    limit = max(1, min(int(limit), 500))
+    per_embed = max(10, min(int(per_embed), 50))
     records = active_sorted_expiring()[:limit]
-    embed = discord.Embed(
-        title=f"Top {limit} Shortest Vanity Countdowns",
-        description="Active countdowns sorted by the least time remaining. The command live-verifies candidates before displaying when enabled.",
-        color=discord.Color.orange(),
-    )
-    embed.add_field(name="Active Countdowns", value=str(len(active_invalid_vanities)), inline=True)
-    embed.add_field(name="Showing", value=str(len(records)), inline=True)
-    alert_channel_id = config.get("invalid_alert_channel_id")
-    embed.add_field(name="Alert Channel", value=f"<#{alert_channel_id}>" if alert_channel_id else "Not set", inline=True)
-    embed.add_field(name="Length Filter", value=f"`{countdown_filter_label()}`", inline=True)
-
     if not records:
-        embed.add_field(name="No Active Countdowns", value="No vanities are currently in the active countdown tracker.", inline=False)
-        return embed
+        embed = discord.Embed(
+            title="Top Shortest Vanity Countdowns",
+            description="No vanities are currently in the active countdown tracker.",
+            color=discord.Color.orange(),
+        )
+        embed.add_field(name="Active Countdowns", value=str(len(active_invalid_vanities)), inline=True)
+        return [embed]
 
-    lines = []
-    for idx, record in enumerate(records, start=1):
-        code = record.get("code", "unknown")
-        expires_dt = parse_iso_dt(record.get("expires_at"))
-        expires_unix = int(expires_dt.timestamp()) if expires_dt else 0
-        remaining = format_duration(seconds_until(record.get("expires_at")))
-        lines.append(f"`{idx}.` `discord.gg/{code}` — `{remaining}` left • <t:{expires_unix}:R>")
+    pages: list[discord.Embed] = []
+    total_pages = (len(records) + per_embed - 1) // per_embed
+    alert_channel_id = config.get("invalid_alert_channel_id")
 
-    for chunk_index, chunk in enumerate(split_embed_lines(lines), start=1):
-        name = "Shortest Countdowns" if chunk_index == 1 else f"Shortest Countdowns Continued {chunk_index}"
-        embed.add_field(name=name, value=chunk, inline=False)
+    for page_index in range(total_pages):
+        start = page_index * per_embed
+        chunk_records = records[start:start + per_embed]
+        embed = discord.Embed(
+            title=f"Top {len(records)} Shortest Vanity Countdowns",
+            description="Active countdowns sorted by the least time remaining. Repeated not-taken rerun logs do not reset timers.",
+            color=discord.Color.orange(),
+        )
+        embed.add_field(name="Active Countdowns", value=str(len(active_invalid_vanities)), inline=True)
+        embed.add_field(name="Showing", value=f"{start + 1}-{start + len(chunk_records)} of {len(records)}", inline=True)
+        embed.add_field(name="Alert Channel", value=f"<#{alert_channel_id}>" if alert_channel_id else "Not set", inline=True)
+        embed.add_field(name="Length Filter", value=f"`{countdown_filter_label()}`", inline=True)
 
-    embed.set_footer(text=f"Use {config.get('prefix', DEFAULT_PREFIX)}countdown <vanity> for exact details. Max shown: 50.")
-    return embed
+        lines = []
+        for idx, record in enumerate(chunk_records, start=start + 1):
+            code = record.get("code", "unknown")
+            expires_dt = parse_iso_dt(record.get("expires_at"))
+            expires_unix = int(expires_dt.timestamp()) if expires_dt else 0
+            remaining = format_duration(seconds_until(record.get("expires_at")))
+            started_dt = parse_iso_dt(record.get("taken_at") or record.get("invalid_at"))
+            started_unix = int(started_dt.timestamp()) if started_dt else 0
+            lines.append(f"`{idx}.` `discord.gg/{code}` — `{remaining}` left • ends <t:{expires_unix}:R> • since <t:{started_unix}:R>")
+
+        for chunk_index, chunk in enumerate(split_embed_lines(lines, max_chars=1000), start=1):
+            name = "Shortest Countdowns" if chunk_index == 1 else f"Shortest Countdowns Continued {chunk_index}"
+            embed.add_field(name=name, value=chunk, inline=False)
+
+        embed.set_footer(text=f"Page {page_index + 1}/{total_pages} • Use {config.get('prefix', DEFAULT_PREFIX)}countdown <vanity> for details. Max shown: 500.")
+        pages.append(embed)
+
+    return pages
+
+
+def build_top_shortest_countdowns_embed(limit: int = 50) -> discord.Embed:
+    # Compatibility wrapper for older call sites.
+    return build_top_shortest_countdowns_embeds(limit=limit)[0]
 
 
 def build_expired_list_embed(limit: int = 10) -> discord.Embed:
@@ -1223,9 +1436,9 @@ async def verify_countdown_records(records: list[dict], *, max_checks: int = 100
 
 async def verify_shortest_candidates_for_top(limit: int = 50) -> dict:
     """Verify enough shortest candidates so !topcountdowns doesn't display stale taken vanities."""
-    limit = max(1, min(int(limit), 50))
-    # Check more than the display limit so taken/stale records are removed and replaced by the next shortest records.
-    candidate_records = active_sorted_expiring()[:min(len(active_invalid_vanities), max(limit, min(limit + 25, 100)))]
+    limit = max(1, min(int(limit), 500))
+    # Check a little more than the display limit so stale records are removed and replaced by the next shortest records.
+    candidate_records = active_sorted_expiring()[:min(len(active_invalid_vanities), max(limit, min(limit + 25, 500)))]
     return await verify_countdown_records(candidate_records, max_checks=len(candidate_records))
 
 
@@ -1551,16 +1764,22 @@ async def run_list_check(list_name: str, list_data: dict, manual_ctx=None):
                     break
 
                 if result == "available":
-                    # 404 / Unknown Invite = NOT on a server. This is the only result that belongs in the TXT file.
+                    # 404 / Unknown Invite = NOT on a server.
+                    # Only start a countdown when the persistent last-known status
+                    # was taken/on-server. This prevents first scans, lost TXT files,
+                    # or redeploys from creating fake fresh timers for everything.
                     available_count += 1
                     available_found.append(code)
 
-                    if add_unavailable(code):
-                        # This is the transition you asked to track: taken/on-server -> not-taken/available.
+                    previous_status = get_last_vanity_status(code)
+                    was_added_to_txt = add_unavailable(code)
+                    if was_added_to_txt:
                         added_count += 1
-                        transition_time = now_iso()
-                        record = add_invalid_vanity(code, list_name, taken_at=transition_time, source="checker_available_transition")
                         await safe_send(log_channel, f"`discord.gg/{code}` is not taken/available and was added to the not-taken TXT file.")
+
+                    transition_time = now_iso()
+                    if previous_status == "taken":
+                        record = add_invalid_vanity(code, list_name, taken_at=transition_time, source="checker_taken_to_available_transition")
                         if record:
                             await safe_send(
                                 log_channel,
@@ -1571,6 +1790,14 @@ async def run_list_check(list_name: str, list_data: dict, manual_ctx=None):
                                 log_channel,
                                 f"Skipped countdown for `discord.gg/{code}` because it does not match the countdown length filter `{countdown_filter_label()}`."
                             )
+                    elif was_added_to_txt and previous_status is None:
+                        write_event_log("available_seeded_without_countdown", {
+                            "code": code,
+                            "list": list_name,
+                            "reason": "no_previous_taken_status",
+                        })
+
+                    set_last_vanity_status(code, "available", list_name=list_name, source="checker", checked_at=transition_time, save=True)
 
                     await safe_send(available_channel, f"discord.gg/{code}")
 
@@ -1579,17 +1806,16 @@ async def run_list_check(list_name: str, list_data: dict, manual_ctx=None):
                     taken_count += 1
                     taken_found.append(code)
 
+                    transition_time = now_iso()
                     if remove_unavailable(code):
                         removed_count += 1
                         await safe_send(log_channel, f"`discord.gg/{code}` is taken/on a server and was removed from the not-taken TXT file.")
 
-                        # If it becomes taken/on-server again, remove it from active/expired countdown tracking.
-                        removed_active, removed_expired = remove_invalid_vanity(code, reason="became_taken", seen_at=now_iso(), save=True)
-                        if removed_active or removed_expired:
-                            await safe_send(
-                                log_channel,
-                                f"`discord.gg/{code}` became taken/on-server again and was removed from the countdown tracker."
-                            )
+                    removed_active, removed_expired = remove_invalid_vanity(code, reason="became_taken_on_server", seen_at=transition_time, save=True)
+                    if removed_active or removed_expired:
+                        await safe_send(log_channel, f"Removed countdown for `discord.gg/{code}` because it is taken/on a server again.")
+
+                    set_last_vanity_status(code, "taken", list_name=list_name, source="checker", checked_at=transition_time, save=True)
 
                     await safe_send(taken_channel, f"discord.gg/{code}")
                     await safe_send(log_channel, f"{length} letters | Taken/on server: `discord.gg/{code}`")
@@ -1724,66 +1950,114 @@ async def autosave_loop():
     # Normal commands and transitions still save immediately.
     save_all_data(reason="autosave_loop")
 
+
+# =========================
+# SLASH HELP PAGES
+# =========================
+
+HELP_PAGE_TITLES = [
+    "Setup",
+    "Lists",
+    "Checks",
+    "Countdowns",
+    "Backfill",
+    "Data / Saves",
+]
+
+
+def build_help_page(page: int = 1) -> discord.Embed:
+    p = config.get("prefix", DEFAULT_PREFIX)
+    total = len(HELP_PAGE_TITLES)
+    page = max(1, min(int(page), total))
+    title = HELP_PAGE_TITLES[page - 1]
+    embed = discord.Embed(
+        title=f"Vanity Checker Help — {title}",
+        description="Use the buttons to switch pages. Prefix commands still work, and this slash help is synced as `/help`.",
+        color=discord.Color.blurple(),
+    )
+
+    if page == 1:
+        embed.add_field(name="Add a List", value=(
+            f"`{p}addlist <name> <available_channel> <taken_channel> <log_channel> <summary_channel> <ping_role|none> <words>`\n"
+            f"Example:\n`{p}addlist 4letters #available #taken #log #summary none love, hate, void, glow`"
+        ), inline=False)
+        embed.add_field(name="Alert Channel", value=f"`{p}setalertchannel #channel` — choose where @everyone completion alerts go", inline=False)
+        embed.add_field(name="Persistence", value="For Railway, attach a Volume and set `DATA_DIR=/data` so lists/countdowns survive redeploys.", inline=False)
+    elif page == 2:
+        embed.add_field(name="Manage Lists", value=(
+            f"`{p}lists`\n`{p}listinfo <name>`\n`{p}addwords <name> <words>`\n"
+            f"`{p}removewords <name> <words>`\n`{p}setchannels <name> <available> <taken> <log> <summary>`\n"
+            f"`{p}setpingrole <name> <role|none>`\n`{p}removelist <name>`\n`{p}clearlists`"
+        ), inline=False)
+        embed.add_field(name="TXT Files", value=f"`{p}unavailablecount <length>`\n`{p}getunavailable <length>`\n`{p}clearunavailable [length]`", inline=False)
+    elif page == 3:
+        embed.add_field(name="Manual Checks", value=f"`{p}checklist <name>`\n`{p}checkall`\n`{p}stop`", inline=False)
+        embed.add_field(name="Auto Checks", value=f"`{p}autocheck <minutes>`\n`{p}autostop`\n`{p}autostatus`", inline=False)
+        embed.add_field(name="Rate Settings", value=f"`{p}ratelimit <delay_seconds> <batch_size> <batch_cooldown_seconds> <list_cooldown_seconds>`", inline=False)
+    elif page == 4:
+        embed.add_field(name="Countdown Logic", value="Countdowns start only on a confirmed `taken/on-server → not-taken/available` transition. Repeated not-taken rerun logs do not reset the timer.", inline=False)
+        embed.add_field(name="Countdown Commands", value=(
+            f"`{p}invalid`\n`{p}invalid <vanity>`\n`{p}countdown <vanity>`\n"
+            f"`{p}invalidrecent [limit]`\n`{p}invalidexpiring [limit]`\n`{p}topcountdowns [limit up to 500]`\n"
+            f"`{p}invalidexpired [limit]`\n`{p}invalidcount`\n`{p}invalidexport`"
+        ), inline=False)
+        embed.add_field(name="Admin Countdown Tools", value=f"`{p}verifycountdowns [limit]`\n`{p}setcountdownlengths <min> [max]`\n`{p}prunecountdowns`\n`{p}resetcountdowns`", inline=False)
+    elif page == 5:
+        embed.add_field(name="Backfill Logic", value="Backfill groups logs by vanity, sorts oldest→newest, then uses the FIRST not-taken log after the most recent taken log. If the newest state is taken, no countdown is kept.", inline=False)
+        embed.add_field(name="Backfill Commands", value=(
+            f"`{p}backfillchannel #channel [message_limit]`\n"
+            f"`{p}backfillinvalid [messages_per_log_channel]`\n"
+            f"`{p}backfillstatus [#channel]`\n"
+            f"`{p}backfilltimeline <vanity> [runs]` — compressed runs like `taken x10`\n"
+            f"`{p}resetbackfill #channel`"
+        ), inline=False)
+        embed.add_field(name="Clean Rebuild", value=f"`{p}resetcountdowns`\n`{p}resetbackfill #log`\n`{p}backfillchannel #log 10000`\n`{p}verifycountdowns 500`", inline=False)
+    else:
+        embed.add_field(name="Data / Saves", value=f"`{p}datastatus`\n`{p}savedata`\n`{p}exportdata`", inline=False)
+        embed.add_field(name="Files Saved", value="`vanity_config.json`, `vanity_statuses.json`, `invalid_vanities.json`, `expired_invalid_vanities.json`, `backfill_scan_state.json`, `backfill_transition_events.json`, and backups in `data/backups/`.", inline=False)
+        embed.add_field(name="Prefix", value=f"`{p}setprefix <prefix>`", inline=False)
+
+    embed.set_footer(text=f"Page {page}/{total}")
+    return embed
+
+
+class HelpPager(discord.ui.View):
+    def __init__(self, start_page: int = 1):
+        super().__init__(timeout=180)
+        self.page = max(1, min(int(start_page), len(HELP_PAGE_TITLES)))
+        self.update_buttons()
+
+    def update_buttons(self):
+        self.prev_button.disabled = self.page <= 1
+        self.next_button.disabled = self.page >= len(HELP_PAGE_TITLES)
+
+    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = max(1, self.page - 1)
+        self.update_buttons()
+        await interaction.response.edit_message(embed=build_help_page(self.page), view=self)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.primary)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = min(len(HELP_PAGE_TITLES), self.page + 1)
+        self.update_buttons()
+        await interaction.response.edit_message(embed=build_help_page(self.page), view=self)
+
+
+@bot.tree.command(name="help", description="Show paged vanity bot help.")
+@app_commands.describe(page="Help page number")
+async def slash_help(interaction: discord.Interaction, page: int = 1):
+    view = HelpPager(start_page=page)
+    await interaction.response.send_message(embed=build_help_page(view.page), view=view, ephemeral=True)
+
 # =========================
 # COMMANDS
 # =========================
 
 @bot.command(name="help")
-async def help_command(ctx):
-    p = config.get("prefix", DEFAULT_PREFIX)
-    embed = discord.Embed(
-        title="Vanity Checker Help",
-        description=(
-            "Checks invite codes safely using Discord's API. "
-            "Not taken/available vanities go to one channel, and taken/on-server vanities go to another."
-        ),
-        color=discord.Color.blurple()
-    )
-    embed.add_field(
-        name="Setup",
-        value=(
-            f"`{p}addlist <name> <available_channel> <taken_channel> <log_channel> <summary_channel> <ping_role|none> <words>`\n"
-            f"Example:\n`{p}addlist 4letters #available #taken #vanity-logs #summaries @Hunters love, hate, void, glow`"
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="Manage Lists",
-        value=(
-            f"`{p}lists`\n`{p}listinfo <name>`\n`{p}addwords <name> <words>`\n"
-            f"`{p}removewords <name> <words>`\n`{p}setchannels <name> <available> <taken> <log> <summary>`\n"
-            f"`{p}setpingrole <name> <role|none>`\n`{p}removelist <name>`\n`{p}clearlists`"
-        ),
-        inline=False
-    )
-    embed.add_field(name="Checks", value=f"`{p}checklist <name>`\n`{p}checkall`\n`{p}stop`", inline=False)
-    embed.add_field(name="Auto Checks", value=f"`{p}autocheck <minutes>`\n`{p}autostop`\n`{p}autostatus`", inline=False)
-    embed.add_field(
-        name="30-Day Not-Taken Countdown Tracker",
-        value=(
-            f"`{p}setalertchannel #channel` - choose where @everyone completion alerts go\n"
-            f"`{p}invalid` - show active countdowns\n"
-            f"`{p}invalid <vanity>` or `{p}countdown <vanity>` - check one countdown\n"
-            f"`{p}invalidrecent [limit]` - recent active countdowns\n"
-            f"`{p}topcountdowns [limit]` - top 50 shortest countdowns, live-verified before display\n"
-            f"`{p}verifycountdowns [limit]` - live-check countdowns and remove ones now taken\n"
-            f"`{p}setcountdownlengths <min> [max]` - filter/prune countdown lengths\n"
-            f"`{p}prunecountdowns` - prune saved records outside the current length filter\n"
-            f"`{p}resetcountdowns` - delete all active/expired countdowns and stored backfill events\n"
-            f"`{p}invalidexpired [limit]` - expired countdown list\n"
-            f"`{p}invalidcount` - active/expired totals\n"
-            f"`{p}invalidexport` - export tracker JSON\n"
-            f"`{p}backfillinvalid [messages_per_log_channel]` - incrementally scan saved log channels\n"
-            f"`{p}backfillchannel #channel [message_limit]` - incrementally scan any channel you choose\n"
-            f"`{p}backfillstatus [#channel]` - show saved scan cursor/progress\n"
-            f"`{p}resetbackfill #channel` - reset a channel scan cursor if you need to rescan"
-        ),
-        inline=False
-    )
-    embed.add_field(name="Settings", value=f"`{p}setprefix <prefix>`\n`{p}ratelimit <delay_seconds> <batch_size> <batch_cooldown_seconds> <list_cooldown_seconds>`", inline=False)
-    embed.add_field(name="Data / Saves", value=f"`{p}datastatus`\n`{p}savedata`\n`{p}exportdata`", inline=False)
-    embed.add_field(name="Available TXT Files", value=f"`{p}unavailablecount <length>`\n`{p}getunavailable <length>`\n`{p}clearunavailable [length]`", inline=False)
-    await ctx.send(embed=embed)
+async def help_command(ctx, page: int = 1):
+    """Prefix fallback help. The slash /help command has the button pages."""
+    await ctx.send(embed=build_help_page(page), view=HelpPager(start_page=page))
 
 
 @bot.command()
@@ -2162,8 +2436,8 @@ async def invalidexpiring(ctx, limit: int = 10):
 
 @bot.command(name="topcountdowns", aliases=["shortestcountdowns", "invalidtop", "topinvalid", "soonestcountdowns"])
 async def topcountdowns(ctx, limit: int = 50):
-    """Show up to 50 active countdowns with the shortest time remaining."""
-    limit = max(1, min(int(limit), 50))
+    """Show active countdowns with the shortest time remaining. Supports up to 500."""
+    limit = max(1, min(int(limit), 500))
     await process_due_countdowns(source="command")
     if config.get("topcountdowns_live_verify", True):
         msg = await ctx.send(f"Verifying the shortest countdown candidates live before showing the top `{limit}`...")
@@ -2172,7 +2446,8 @@ async def topcountdowns(ctx, limit: int = 50):
             await msg.edit(content=f"Verified `{stats['checked']}` countdown candidate(s). Removed `{stats['removed_taken']}` that are now taken and `{stats['skipped_untrackable']}` outside the length filter.")
         except Exception:
             pass
-    await ctx.send(embed=build_top_shortest_countdowns_embed(limit=limit))
+    for embed in build_top_shortest_countdowns_embeds(limit=limit):
+        await ctx.send(embed=embed)
 
 
 @bot.command(name="invalidexpired", aliases=["expiredinvalid"])
@@ -2447,6 +2722,10 @@ async def rebuild_countdowns_from_messages(
         "replaced_expired": replay_stats.get("replaced_expired", 0),
         "removed_by_taken": replay_stats.get("removed_by_taken", 0),
         "skipped_latest_taken": replay_stats.get("skipped_latest_taken", replay_stats.get("removed_by_taken", 0)),
+        "skipped_no_prior_taken": replay_stats.get("skipped_no_prior_taken", 0),
+        "ignored_repeat_available": replay_stats.get("ignored_repeat_available", 0),
+        "ignored_repeat_taken": replay_stats.get("ignored_repeat_taken", 0),
+        "replaced_newer_existing_with_earlier_streak": replay_stats.get("replaced_newer_existing_with_earlier_streak", 0),
         "kept_newer_existing": replay_stats.get("kept_newer_existing", 0),
         "active_total": replay_stats.get("active_total", len(active_invalid_vanities)),
         "expired_total": replay_stats.get("expired_total", len(expired_invalid_vanities)),
@@ -2468,7 +2747,10 @@ def build_backfill_result_embed(title: str, stats: dict) -> discord.Embed:
     embed.add_field(name="Active Updated", value=str(stats.get("updated_active", 0)), inline=True)
     embed.add_field(name="Moved To Expired", value=str(stats.get("moved_expired", 0)), inline=True)
     embed.add_field(name="Latest Taken / Skipped", value=str(stats.get("skipped_latest_taken", stats.get("removed_by_taken", 0))), inline=True)
-    embed.add_field(name="Kept Newer Existing", value=str(stats.get("kept_newer_existing", 0)), inline=True)
+    embed.add_field(name="Repeat Available Logs Ignored", value=str(stats.get("ignored_repeat_available", 0)), inline=True)
+    embed.add_field(name="Repeat Taken Logs Ignored", value=str(stats.get("ignored_repeat_taken", 0)), inline=True)
+    embed.add_field(name="Available Without Prior Taken Skipped", value=str(stats.get("skipped_no_prior_taken", 0)), inline=True)
+    embed.add_field(name="Newer Fake Timer Replaced", value=str(stats.get("replaced_newer_existing_with_earlier_streak", 0)), inline=True)
     embed.add_field(name="Active Total", value=str(stats.get("active_total", 0)), inline=True)
     embed.add_field(name="Expired Total", value=str(stats.get("expired_total", 0)), inline=True)
     failed = stats.get("failed_channels") or []
@@ -2477,8 +2759,78 @@ def build_backfill_result_embed(title: str, stats: dict) -> discord.Embed:
     notes = stats.get("channel_notes") or []
     if notes:
         embed.add_field(name="Channel Notes", value="\n".join(notes[:8]), inline=False)
-    embed.set_footer(text="Backfill only keeps countdowns when the newest scanned update for that vanity is not-taken/available. If a newer log says taken/on-server, it is skipped/removed.")
+    embed.set_footer(text="Backfill uses the first not-taken log after the most recent taken log. Repeated not-taken/taken rerun logs are collapsed and ignored.")
     return embed
+
+
+def build_backfill_timeline_embed(code: str, limit: int = 30) -> discord.Embed:
+    code = clean_code(code)
+    events_by_code = get_events_by_code_from_backfill()
+    events = events_by_code.get(code, [])
+
+    embed = discord.Embed(
+        title=f"Backfill Status Runs: discord.gg/{code}",
+        color=discord.Color.blurple(),
+    )
+
+    if not events:
+        embed.description = "No stored backfill transition events were found for this vanity. Run `!backfillchannel #log 10000` first."
+        return embed
+
+    runs = compress_status_runs(events)
+    shown_runs = runs[-max(1, min(int(limit), 50)):]
+
+    latest = runs[-1]
+    latest_status = latest.get("status", "unknown")
+    embed.add_field(name="Stored Raw Events", value=str(len(events)), inline=True)
+    embed.add_field(name="Compressed Runs", value=str(len(runs)), inline=True)
+    embed.add_field(name="Newest Status", value=f"`{latest_status}`", inline=True)
+
+    active = active_invalid_vanities.get(code)
+    expired = expired_invalid_vanities.get(code)
+    if active:
+        embed.add_field(name="Countdown Start", value=discord_relative(active.get("taken_at") or active.get("invalid_at")), inline=False)
+        embed.add_field(name="Countdown Ends", value=discord_relative(active.get("expires_at")), inline=False)
+    elif expired:
+        embed.add_field(name="Expired Countdown Start", value=discord_relative(expired.get("taken_at") or expired.get("invalid_at")), inline=False)
+        embed.add_field(name="Expired At", value=discord_relative(expired.get("expired_at") or expired.get("expires_at")), inline=False)
+    else:
+        if latest_status == "taken":
+            reason = "No countdown is kept because the newest stored status is taken/on-server."
+        else:
+            reason = "No countdown is kept because the available run does not have a prior taken/on-server event in scanned history."
+        embed.add_field(name="Countdown Status", value=reason, inline=False)
+
+    lines = []
+    for idx, run in enumerate(shown_runs, start=max(1, len(runs) - len(shown_runs) + 1)):
+        status_label = "not taken" if run["status"] == "available" else "taken"
+        count_suffix = f" x{run['count']}" if run.get("count", 1) > 1 else ""
+        first_at = parse_iso_dt(run.get("first_at"))
+        last_at = parse_iso_dt(run.get("last_at"))
+        if first_at and last_at and run.get("count", 1) > 1:
+            time_text = f"<t:{int(first_at.timestamp())}:g> → <t:{int(last_at.timestamp())}:g>"
+        elif first_at:
+            time_text = f"<t:{int(first_at.timestamp())}:g>"
+        else:
+            time_text = "Unknown time"
+        lines.append(f"`{idx}.` **{status_label}{count_suffix}** — {time_text}")
+
+    for chunk_index, chunk in enumerate(split_embed_lines(lines, max_chars=1000), start=1):
+        embed.add_field(name="Compressed Status Runs" if chunk_index == 1 else f"Compressed Status Runs {chunk_index}", value=chunk, inline=False)
+
+    embed.set_footer(text="Repeated same-status logs are compressed, like taken x10 or not taken x4. The countdown starts at the first not-taken run after the latest taken run.")
+    return embed
+
+
+@bot.command(name="backfilltimeline", aliases=["statusruns", "vanitytimeline", "backfillruns"])
+async def backfilltimeline(ctx, vanity: str, limit: int = 30):
+    """Show compressed backfill status runs for one vanity without flooding duplicates."""
+    code = clean_code(vanity)
+    if not code:
+        await ctx.send("Give me a valid vanity, like `mean` or `discord.gg/mean`.")
+        return
+    load_backfill_progress()
+    await ctx.send(embed=build_backfill_timeline_embed(code, limit=limit))
 
 
 @bot.command(name="backfillchannel", aliases=["backfillinvalidchannel", "backfillfromchannel"])
@@ -2660,6 +3012,7 @@ async def datastatus(ctx):
     embed.add_field(name="Expired Countdowns", value=f"`{len(expired_invalid_vanities)}`", inline=True)
     embed.add_field(name="Backfill Channels", value=f"`{len(backfill_scan_state)}`", inline=True)
     embed.add_field(name="Backfill Events", value=f"`{len(backfill_transition_events)}`", inline=True)
+    embed.add_field(name="Saved Vanity Statuses", value=f"`{len(vanity_statuses)}`", inline=True)
 
     files = [
         CONFIG_FILE, ACTIVE_INVALID_FILE, EXPIRED_INVALID_FILE,
@@ -2760,12 +3113,15 @@ async def on_resumed():
 
 @bot.event
 async def on_ready():
+    global _slash_commands_synced
     ensure_dirs()
     ensure_unavailable_files()
     load_config()
     load_unavailable_cache()
     load_invalid_tracker()
     load_backfill_progress()
+    load_vanity_statuses()
+    seed_statuses_from_not_taken_files()
 
     if not auto_check_loop.is_running():
         auto_check_loop.start()
@@ -2775,6 +3131,14 @@ async def on_ready():
         autosave_loop.start()
 
     await process_due_countdowns(source="startup")
+    if not _slash_commands_synced:
+        try:
+            await bot.tree.sync()
+            _slash_commands_synced = True
+            write_event_log("slash_commands_synced", {"commands": len(bot.tree.get_commands())})
+        except Exception as e:
+            logger.warning("Slash command sync failed: %s", e)
+            write_event_log("slash_command_sync_failed", {"error": short_text(e, 200)})
     save_all_data(reason="startup_sync")
 
     logger.info(
@@ -2805,6 +3169,8 @@ if __name__ == "__main__":
     load_unavailable_cache()
     load_invalid_tracker()
     load_backfill_progress()
+    load_vanity_statuses()
+    seed_statuses_from_not_taken_files()
     write_event_log("bot_process_starting", {"data_dir": str(DATA_DIR), "lists": len(config.get("lists", {}))})
     if not TOKEN:
         raise RuntimeError("DISCORD_TOKEN is missing from environment variables. Add it in Railway Variables.")
