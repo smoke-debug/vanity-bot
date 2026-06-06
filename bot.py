@@ -2098,6 +2098,186 @@ async def send_words_output(channel, title: str, words: list[str]):
         f.write(paragraph)
     await safe_send(channel, content=f"{title} was too long, so here is the txt file:", file=discord.File(str(file_path), filename=file_path.name))
 
+
+def classify_not_taken_status(code: str, *, previous_status: Optional[str] = None, new_countdown: bool = False, added_to_txt: bool = False) -> dict:
+    """Return an easy-to-read status badge for a not-taken/available vanity.
+
+    This is only for summary readability. It does not change countdown logic.
+    The goal is to make every available result visibly different:
+    green = fresh/live countdown, yellow = backfilled countdown, red = no countdown.
+    """
+    code = clean_code(code)
+    active = active_invalid_vanities.get(code)
+    expired = expired_invalid_vanities.get(code)
+
+    if new_countdown and active:
+        return {
+            "key": "new_live",
+            "emoji": "🟢",
+            "label": "New live countdown",
+            "detail": f"ends {discord_relative(active.get('expires_at'))}",
+            "sort": 0,
+        }
+
+    if active:
+        source = str(active.get("source") or "").lower()
+        confidence = active.get("confidence") or source_confidence(active.get("source"))[0]
+        if any(token in source for token in ["backfill", "discord_log", "log"]):
+            return {
+                "key": "backfill_countdown",
+                "emoji": "🟡",
+                "label": "Backfill countdown",
+                "detail": f"{confidence} confidence • ends {discord_relative(active.get('expires_at'))}",
+                "sort": 1,
+            }
+        return {
+            "key": "live_countdown",
+            "emoji": "🟢",
+            "label": "Live countdown",
+            "detail": f"{confidence} confidence • ends {discord_relative(active.get('expires_at'))}",
+            "sort": 2,
+        }
+
+    if expired:
+        return {
+            "key": "expired",
+            "emoji": "🟣",
+            "label": "Expired timer",
+            "detail": f"expired {discord_relative(expired.get('expired_at') or expired.get('expires_at'))}",
+            "sort": 3,
+        }
+
+    if previous_status is None:
+        label = "No countdown / unknown previous status"
+        detail = "seen available, but no proven taken→available change"
+    elif previous_status == "available":
+        label = "No countdown / already available"
+        detail = "rerun/unchanged available result"
+    else:
+        label = "No countdown"
+        detail = "not currently in countdown tracker"
+
+    if added_to_txt:
+        detail += " • added to TXT"
+
+    return {
+        "key": "no_countdown",
+        "emoji": "🔴",
+        "label": label,
+        "detail": detail,
+        "sort": 9,
+    }
+
+
+def make_not_taken_status_row(code: str, status: dict) -> str:
+    return f"{status.get('emoji', '•')} discord.gg/{clean_code(code)} — {status.get('label', 'Unknown')} ({status.get('detail', 'no details')})"
+
+
+async def send_not_taken_status_summary(channel, list_name: str, status_rows: list[dict]) -> None:
+    """Send a compact embed plus a full TXT so not-taken results are easy to read."""
+    if not status_rows:
+        return
+
+    grouped = defaultdict(list)
+    for row in status_rows:
+        grouped[row["status"].get("key", "unknown")].append(row)
+
+    order = ["new_live", "live_countdown", "backfill_countdown", "expired", "no_countdown"]
+    labels = {
+        "new_live": "🟢 New live countdowns",
+        "live_countdown": "🟢 Active live countdowns",
+        "backfill_countdown": "🟡 Active backfill countdowns",
+        "expired": "🟣 Expired timers",
+        "no_countdown": "🔴 No countdown / unchanged",
+    }
+
+    embed = discord.Embed(
+        title=f"Not-Taken Status Breakdown: {list_name}",
+        description=(
+            "Green = active/new live countdown • Yellow = backfilled countdown • "
+            "Purple = timer already expired • Red = no proven countdown.\n"
+            "Red entries are usually reruns, first-seen available words, or words with no proven taken→available transition."
+        ),
+        color=discord.Color.blurple(),
+    )
+
+    total_active = len(grouped.get("new_live", [])) + len(grouped.get("live_countdown", [])) + len(grouped.get("backfill_countdown", []))
+    embed.add_field(name="Available Checked", value=str(len(status_rows)), inline=True)
+    embed.add_field(name="On Countdown", value=str(total_active), inline=True)
+    embed.add_field(name="No Countdown", value=str(len(grouped.get("no_countdown", []))), inline=True)
+
+    for key in order:
+        rows = grouped.get(key, [])
+        if not rows:
+            continue
+        lines = []
+        for row in rows[:10]:
+            lines.append(make_not_taken_status_row(row["code"], row["status"]))
+        more = len(rows) - len(lines)
+        if more > 0:
+            lines.append(f"…and {more} more")
+        value = "\n".join(lines)
+        if len(value) > 1000:
+            value = value[:990] + "..."
+        embed.add_field(name=f"{labels.get(key, key)} — {len(rows)}", value=value or "None", inline=False)
+
+    embed.set_footer(text="A full categorized TXT is attached when the result list is long.")
+    await safe_send(channel, embed=embed)
+
+    full_lines = []
+    for key in order:
+        rows = grouped.get(key, [])
+        if not rows:
+            continue
+        full_lines.append(f"{labels.get(key, key)} — {len(rows)}")
+        for row in rows:
+            full_lines.append(make_not_taken_status_row(row["code"], row["status"]))
+        full_lines.append("")
+
+    full_text = "\n".join(full_lines).strip()
+    if len(full_text) > 1850 or len(status_rows) > 40:
+        safe_name = clean_code(list_name) or "list"
+        file_path = DATA_DIR / f"{safe_name}_not_taken_status_breakdown.txt"
+        atomic_write_text(file_path, full_text + "\n")
+        await safe_send(channel, content="Full not-taken status breakdown:", file=discord.File(str(file_path), filename=file_path.name))
+
+
+def build_status_legend_embed() -> discord.Embed:
+    p = config.get("prefix", DEFAULT_PREFIX)
+    embed = discord.Embed(
+        title="Not-Taken Summary Status Legend",
+        description="These badges appear in the check summary so you can tell which available vanities are actually on countdown.",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(
+        name="🟢 New live countdown",
+        value="The current check proved `taken/on-server → not-taken/available`, so a fresh 30-day timer was started.",
+        inline=False,
+    )
+    embed.add_field(
+        name="🟢 Active live countdown",
+        value="Already on countdown from a live checker transition. Usually highest confidence.",
+        inline=False,
+    )
+    embed.add_field(
+        name="🟡 Active backfill countdown",
+        value="On countdown from log-channel backfill. Uses the first not-taken log after the most recent taken log.",
+        inline=False,
+    )
+    embed.add_field(
+        name="🟣 Expired timer",
+        value="The 30-day timer already completed and was moved into the expired countdown list.",
+        inline=False,
+    )
+    embed.add_field(
+        name="🔴 No countdown / unchanged",
+        value="Currently not taken, but no proven `taken → not taken` transition exists. Usually a rerun, first-seen available vanity, or no reliable countdown source.",
+        inline=False,
+    )
+    embed.set_footer(text=f"Use {p}topcountdowns 100 to view active timers, or {p}invalid <vanity> for one vanity.")
+    return embed
+
+
 # =========================
 # CHECK RUNNERS
 # =========================
@@ -2150,6 +2330,7 @@ async def run_list_check(list_name: str, list_data: dict, manual_ctx=None):
     available_found = []
     taken_found = []
     error_found = []
+    available_status_rows = []
 
     status_msg = await safe_send(summary_channel, f"Checking `{list_name}` — `{len(cleaned_codes)}` word(s)...")
 
@@ -2188,9 +2369,11 @@ async def run_list_check(list_name: str, list_data: dict, manual_ctx=None):
                         await safe_send(log_channel, f"`discord.gg/{code}` is not taken/available and was added to the not-taken TXT file.")
 
                     transition_time = now_iso()
+                    new_countdown_started = False
                     if previous_status == "taken":
                         record = add_invalid_vanity(code, list_name, taken_at=transition_time, source="checker_taken_to_available_transition")
                         if record:
+                            new_countdown_started = True
                             await safe_send(
                                 log_channel,
                                 f"Started 30-day countdown for `discord.gg/{code}`. Ends {discord_relative(record.get('expires_at'))}."
@@ -2206,6 +2389,14 @@ async def run_list_check(list_name: str, list_data: dict, manual_ctx=None):
                             "list": list_name,
                             "reason": "no_previous_taken_status",
                         })
+
+                    status_badge = classify_not_taken_status(
+                        code,
+                        previous_status=previous_status,
+                        new_countdown=new_countdown_started,
+                        added_to_txt=was_added_to_txt,
+                    )
+                    available_status_rows.append({"code": code, "status": status_badge})
 
                     set_last_vanity_status(code, "available", list_name=list_name, source="checker", checked_at=transition_time, save=True)
 
@@ -2289,6 +2480,7 @@ async def run_list_check(list_name: str, list_data: dict, manual_ctx=None):
 
         # End-of-check word lists go to the summary channel.
         await send_words_output(summary_channel, f"Not taken / available words for `{list_name}`", available_found)
+        await send_not_taken_status_summary(summary_channel, list_name, available_status_rows)
         await send_words_output(summary_channel, f"Taken / currently on a server words for `{list_name}`", taken_found)
         if error_found:
             await send_words_output(summary_channel, f"Errors / skipped words for `{list_name}`", error_found)
@@ -2407,6 +2599,7 @@ def build_help_page(page: int = 1) -> discord.Embed:
         embed.add_field(name="TXT Files", value=f"`{p}unavailablecount <length>`\n`{p}getunavailable <length>`\n`{p}clearunavailable [length]`", inline=False)
     elif page == 3:
         embed.add_field(name="Manual Checks", value=f"`{p}checklist <name>`\n`{p}checkall`\n`{p}stop`", inline=False)
+        embed.add_field(name="Summary Status Badges", value=f"Check summaries now show 🟢 live countdowns, 🟡 backfill countdowns, 🟣 expired timers, and 🔴 no-countdown/unchanged results. Use `{p}statuslegend` for the full legend.", inline=False)
         embed.add_field(name="Auto Checks", value=f"`{p}autocheck <minutes>`\n`{p}autostop`\n`{p}autostatus`", inline=False)
         embed.add_field(name="Rate Settings", value=f"`{p}ratelimit <delay_seconds> <batch_size> <batch_cooldown_seconds> <list_cooldown_seconds>`", inline=False)
     elif page == 4:
@@ -2475,6 +2668,12 @@ async def slash_help(interaction: discord.Interaction, page: int = 1):
 async def help_command(ctx, page: int = 1):
     """Prefix fallback help. The slash /help command has the button pages."""
     await ctx.send(embed=build_help_page(page), view=HelpPager(start_page=page))
+
+
+@bot.command(name="statuslegend", aliases=["summarylegend", "countdownlegend", "availablelegend"])
+async def statuslegend(ctx):
+    """Explain the color/status badges used in the not-taken summary."""
+    await ctx.send(embed=build_status_legend_embed())
 
 
 @bot.command()
